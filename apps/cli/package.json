@@ -1,0 +1,69 @@
+{
+  "name": "@clawdot/cli",
+  "version": "0.1.0",
+  "description": "Run coding agents on your machine, drive them from your phone — terminal sessions over an end-to-end encrypted relay",
+  "license": "MIT",
+  "author": "Marty Stephan",
+  "homepage": "https://github.com/martystephan/clawdot#readme",
+  "bugs": {
+    "url": "https://github.com/martystephan/clawdot/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/martystephan/clawdot.git",
+    "directory": "apps/cli"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "ai",
+    "coding-agent",
+    "terminal",
+    "remote",
+    "mobile",
+    "claude",
+    "daemon"
+  ],
+  "type": "module",
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "clawdot": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "prepublishOnly": "tsup",
+    "dev": "tsx watch src/index.ts serve --port 8788 --data-dir .dev-data --no-relay",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit",
+    "test": "tsx --test test/notifications.test.mjs && tsx test/e2e.mjs && tsx test/relay-e2e.mjs"
+  },
+  "dependencies": {
+    "@clack/prompts": "^1.5.1",
+    "@lydell/node-pty": "1.2.0-beta.12",
+    "@xterm/addon-serialize": "^0.14.0",
+    "@xterm/addon-unicode11": "^0.9.0",
+    "@xterm/headless": "^6.0.0",
+    "qrcode-terminal": "^0.12.0",
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@clawdot/protocol": "workspace:*",
+    "@types/node": "^22.15.0",
+    "@types/qrcode-terminal": "^0.12.2",
+    "@types/ws": "^8.18.1",
+    "tsup": "^8.4.0",
+    "tsx": "^4.19.0"
+  }
+}

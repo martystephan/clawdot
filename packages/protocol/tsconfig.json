@@ -1,0 +1,9 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    // tunnel.ts uses the isomorphic web globals (crypto, TextEncoder, btoa)
+    // that exist in both browsers and Node >= 20.
+    "lib": ["ES2022", "DOM"]
+  },
+  "include": ["src"]
+}

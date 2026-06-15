@@ -1,0 +1,6 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Full circle in accent color (#948c80) -->
+  <circle cx="128" cy="128" r="128" fill="#948c80"/>
+  <!-- 25% pie slice from 12 o'clock to 3 o'clock, clockwise -->
+  <path d="M128 128 L128 0 A128 128 0 0 1 256 128 Z" fill="#d4d1cc"/>
+</svg>

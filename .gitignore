@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+# npm pack artifacts
+*.tgz
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Dev daemon state (apps/cli `pnpm dev`)
+.dev-data/
+
+# Native mobile shell — kept local, not published (holds signing config,
+# Apple Team ID, and the Firebase GoogleService-Info.plist credential)
+apps/web/src-tauri/
+docs/notifications.md
+
+# Editor / OS junk
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
