@@ -347,14 +347,15 @@ export const ServerMessage = z.discriminatedUnion("type", [
   /**
    * Response to pair.start. `ticket` is the encoded pairing ticket (relay URL,
    * daemon key, one-time secret); `url` is the QR-friendly web app link with
-   * the ticket in the fragment; `expiresAt` is a unix ms deadline.
+   * the ticket in the fragment; `expiresAt` is a unix ms deadline, or null when
+   * unlimited pairing is on (the token never expires and pairs many devices).
    */
   z.object({
     type: z.literal("pair.ticket"),
     ticket: z.string(),
     url: z.string(),
     relayUrl: z.string(),
-    expiresAt: z.number(),
+    expiresAt: z.number().nullable(),
   }),
   /** Response to device.list / device.revoke. */
   z.object({

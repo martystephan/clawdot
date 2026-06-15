@@ -24,8 +24,12 @@ export async function runPair(port: number): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  const minutes = Math.round((ticket.expiresAt - Date.now()) / 60_000);
-  s.stop(`Pairing window open — ${minutes} minutes, pairs one device`);
+  if (ticket.expiresAt === null) {
+    s.stop("Pairing window open — never expires, pairs unlimited devices");
+  } else {
+    const minutes = Math.round((ticket.expiresAt - Date.now()) / 60_000);
+    s.stop(`Pairing window open — ${minutes} minutes, pairs one device`);
+  }
 
   console.log("\n  Scan with your phone camera:\n");
   qrcode.generate(ticket.url, { small: true });

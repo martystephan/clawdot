@@ -6,7 +6,7 @@
  * keeps one socket; each remote client is a multiplexed channel on it. Every
  * channel runs its own E2E handshake — the relay only ever sees ciphertext.
  */
-import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import WebSocket from "ws";
 import {
@@ -70,12 +70,25 @@ export class TunnelService {
   // connection state — never persisted). Excluded from pushTargets: a user
   // looking at the app shouldn't be pushed about a background terminal.
   private readonly foregroundDevices = new Set<string>();
-  private window: { secret: Uint8Array; expiresAt: number } | null = null;
+  /**
+   * The open pairing window. `expiresAt: null` means it never expires and
+   * `persistent: true` means a successful pairing does NOT consume it (the
+   * unlimited mode used for reviewer test links). Ordinary windows are
+   * time-limited and single-use.
+   */
+  private window: {
+    secret: Uint8Array;
+    expiresAt: number | null;
+    persistent: boolean;
+  } | null = null;
+  /** Where the unlimited-pairing secret persists, so its token survives restarts. */
+  private readonly pairingPath: string;
 
   constructor(
     dataDir: string,
     readonly relayUrl: string,
   ) {
+    this.pairingPath = join(dataDir, "pairing.json");
     const identityPath = join(dataDir, "identity.json");
     if (existsSync(identityPath)) {
       const raw = JSON.parse(readFileSync(identityPath, "utf8")) as {
@@ -112,11 +125,61 @@ export class TunnelService {
     writeFileSync(this.devicesPath, JSON.stringify(this.devices, null, 2));
   }
 
-  /** Open a pairing window: one secret, one device, limited time. */
-  startPairing(): { ticket: string; url: string; expiresAt: number } {
+  /**
+   * Reconcile the persistent (unlimited) pairing window with the config flag,
+   * called once at startup. When on, opens a never-expiring window from a
+   * secret persisted in the data dir, so the same token keeps working across
+   * daemon restarts and pairs any number of devices. When off, forgets any
+   * persisted unlimited token so disabling the setting actually revokes it.
+   */
+  setUnlimitedPairing(enabled: boolean): void {
+    if (enabled) {
+      this.window = { secret: this.loadOrCreatePairingSecret(), expiresAt: null, persistent: true };
+    } else {
+      if (existsSync(this.pairingPath)) rmSync(this.pairingPath);
+      if (this.window?.persistent) this.window = null;
+    }
+  }
+
+  private loadOrCreatePairingSecret(): Uint8Array {
+    if (existsSync(this.pairingPath)) {
+      try {
+        const raw = JSON.parse(readFileSync(this.pairingPath, "utf8")) as { secret?: string };
+        const decoded = raw.secret ? fromBase64Url(raw.secret) : null;
+        if (decoded) return decoded;
+      } catch {
+        // Corrupt — fall through and mint a fresh one.
+      }
+    }
     const secret = randomBytes(SECRET_LENGTH);
-    const expiresAt = Date.now() + PAIRING_WINDOW_MS;
-    this.window = { secret, expiresAt };
+    writeFileSync(this.pairingPath, JSON.stringify({ secret: toBase64Url(secret) }, null, 2));
+    chmodSync(this.pairingPath, 0o600);
+    return secret;
+  }
+
+  /**
+   * Open a pairing window. By default: one secret, one device, limited time.
+   * With `unlimited`, reuses the persisted never-expiring secret so the token
+   * is stable across restarts and pairs unlimited devices.
+   */
+  startPairing(opts: { unlimited?: boolean } = {}): {
+    ticket: string;
+    url: string;
+    expiresAt: number | null;
+  } {
+    let secret: Uint8Array;
+    let expiresAt: number | null;
+    if (opts.unlimited) {
+      // Reuse the already-open persistent window's secret if present, so a
+      // re-run of `clawdot pair` reprints the same token.
+      const open = this.window;
+      secret = open?.persistent ? open.secret : this.loadOrCreatePairingSecret();
+      expiresAt = null;
+    } else {
+      secret = randomBytes(SECRET_LENGTH);
+      expiresAt = Date.now() + PAIRING_WINDOW_MS;
+    }
+    this.window = { secret, expiresAt, persistent: opts.unlimited ?? false };
     const ticket = {
       relayUrl: this.relayUrl,
       daemonKey: this.identity.publicKey,
@@ -126,7 +189,8 @@ export class TunnelService {
   }
 
   pairingSecret(): Uint8Array | null {
-    if (!this.window || Date.now() > this.window.expiresAt) return null;
+    if (!this.window) return null;
+    if (this.window.expiresAt !== null && Date.now() > this.window.expiresAt) return null;
     return this.window.secret;
   }
 
@@ -134,14 +198,17 @@ export class TunnelService {
     return toBase64Url(devicePublicKey) in this.devices;
   }
 
-  /** Called after a successful pairing handshake — consumes the window. */
+  /**
+   * Called after a successful pairing handshake. Consumes an ordinary window;
+   * a persistent (unlimited) window stays open so more devices can pair.
+   */
   registerDevice(devicePublicKey: Uint8Array): void {
     const key = toBase64Url(devicePublicKey);
     this.devices[key] = {
       addedAt: this.devices[key]?.addedAt ?? Date.now(),
       lastSeenAt: Date.now(),
     };
-    this.window = null;
+    if (!this.window?.persistent) this.window = null;
     this.saveDevices();
   }
 

@@ -34,6 +34,13 @@ export async function runConfig(dataDir: string): Promise<void> {
           label: "Daemon port",
           hint: String(current.port ?? 8787),
         },
+        {
+          value: "unlimitedPairing",
+          label: "Unlimited pairing token",
+          hint: current.unlimitedPairing
+            ? "on — token never expires, pairs unlimited devices"
+            : "off — 10-minute, one-device window",
+        },
         { value: "done", label: "Done" },
       ],
     });
@@ -53,7 +60,7 @@ export async function runConfig(dataDir: string): Promise<void> {
         p.log.warn("Could not reach that relay's /healthz — saved anyway.");
       }
       config.update({ relayUrl: relayUrl || undefined });
-    } else {
+    } else if (field === "port") {
       const value = await p.text({
         message: "Daemon port",
         initialValue: String(current.port ?? 8787),
@@ -61,6 +68,18 @@ export async function runConfig(dataDir: string): Promise<void> {
       });
       bailIfCancelled(value);
       config.update({ port: Number(value) });
+    } else {
+      const value = await p.confirm({
+        message: "Make the pairing token never expire and pair unlimited devices?",
+        initialValue: current.unlimitedPairing ?? false,
+      });
+      bailIfCancelled(value);
+      if (value) {
+        p.log.warn(
+          "Anyone with the token can pair until you turn this off. Use it for trusted reviewers, then disable it.",
+        );
+      }
+      config.update({ unlimitedPairing: value || undefined });
     }
     changed = true;
     p.log.success("Saved.");

@@ -63,13 +63,10 @@ packages/
 
 ## Install
 
-Until the package is published to npm, install the CLI from a checkout
-(`@clawdot/protocol` is bundled into the build, so the package is
-self-contained):
+Install the CLI from npm:
 
 ```sh
-pnpm install && pnpm build
-npm install -g ./apps/cli     # puts `clawdot` on PATH
+npm install -g clawdot     # puts `clawdot` on PATH
 
 clawdot                    # interactive menu — first run opens the setup wizard
 

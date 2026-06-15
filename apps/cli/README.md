@@ -8,7 +8,7 @@ only ever sees ciphertext.
 ## Install
 
 ```sh
-npm install -g @clawdot/cli
+npm install -g clawdot
 clawdot          # interactive menu — the first run opens the setup wizard
 ```
 

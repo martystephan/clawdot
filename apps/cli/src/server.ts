@@ -465,7 +465,9 @@ function createConnection(
           });
           return;
         }
-        const { ticket, url, expiresAt } = ctx.tunnel.startPairing();
+        const { ticket, url, expiresAt } = ctx.tunnel.startPairing({
+          unlimited: ctx.config.get().unlimitedPairing ?? false,
+        });
         send({
           type: "pair.ticket",
           ticket,
@@ -534,6 +536,8 @@ export function startServer(opts: {
 
   const tunnel = opts.relayUrl ? new TunnelService(opts.dataDir, opts.relayUrl) : null;
   const config = new ConfigStore(opts.dataDir);
+  // Open (or revoke) the never-expiring reviewer pairing token to match config.
+  tunnel?.setUnlimitedPairing(config.get().unlimitedPairing ?? false);
   const ctx: ConnectionContext = {
     workspaces,
     clients,

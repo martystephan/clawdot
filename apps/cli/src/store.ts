@@ -22,6 +22,13 @@ export interface DaemonConfig {
   previewAllowedHosts?: string[];
   /** Push a notification when an unwatched agent rings the bell. Default true. */
   notifyOnBell?: boolean;
+  /**
+   * Make the pairing token never expire and pair unlimited devices (instead of
+   * the default 10-minute, one-device window). Local-only — like relay/port it
+   * is never exposed in the app's settings dialog, since it widens who can
+   * pair. Meant for handing a stable test link to reviewers (e.g. Apple staff).
+   */
+  unlimitedPairing?: boolean;
 }
 
 /**

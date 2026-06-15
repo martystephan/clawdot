@@ -6,7 +6,7 @@
 // device reconnect, and daemon surviving a relay restart.
 // Build cli, relay and protocol first; runs dist/.
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -50,34 +50,38 @@ async function startRelay() {
   });
 }
 
-await startRelay();
-daemon = spawn(
-  "node",
-  [
-    join(here, "../dist/index.js"),
-    "serve",
-    "--port",
-    String(DAEMON_PORT),
-    "--relay",
-    `ws://localhost:${RELAY_PORT}/v1`,
-  ],
-  {
-    env: {
-      ...process.env,
-      CLAWDOT_DATA_DIR: dataDir,
+async function startDaemon() {
+  daemon = spawn(
+    "node",
+    [
+      join(here, "../dist/index.js"),
+      "serve",
+      "--port",
+      String(DAEMON_PORT),
+      "--relay",
+      `ws://localhost:${RELAY_PORT}/v1`,
+    ],
+    {
+      env: {
+        ...process.env,
+        CLAWDOT_DATA_DIR: dataDir,
+      },
+      stdio: ["ignore", "pipe", "inherit"],
     },
-    stdio: ["ignore", "pipe", "inherit"],
-  },
-);
-await new Promise((resolve, reject) => {
-  let out = "";
-  daemon.stdout.on("data", (d) => {
-    out += d.toString();
-    if (out.includes("relay: connected")) resolve();
+  );
+  await new Promise((resolve, reject) => {
+    let out = "";
+    daemon.stdout.on("data", (d) => {
+      out += d.toString();
+      if (out.includes("relay: connected")) resolve();
+    });
+    daemon.on("error", reject);
+    setTimeout(() => reject(new Error("daemon did not reach the relay")), 5000);
   });
-  daemon.on("error", reject);
-  setTimeout(() => reject(new Error("daemon did not reach the relay")), 5000);
-});
+}
+
+await startRelay();
+await startDaemon();
 
 // --- Mint a pairing ticket over the LOCAL socket -------------------------------
 const ticketMsg = await new Promise((resolve, reject) => {
@@ -309,6 +313,30 @@ check("device.revoke empties the registry", revoked.devices?.length === 0);
 const phone3 = tunnelClient(device); // same key, but no longer trusted
 check("revoked device cannot reconnect", (await phone3.established) === null);
 phone3.close();
+
+// --- Unlimited pairing: a never-expiring token that pairs many devices ---------
+// Turn the local-only config flag on and restart; the token now never expires
+// and a successful pairing does NOT consume the window.
+daemon.kill();
+await new Promise((r) => setTimeout(r, 300));
+writeFileSync(join(dataDir, "config.json"), JSON.stringify({ unlimitedPairing: true }));
+await startDaemon();
+
+const unlimitedMsg = await localRequest({ type: "pair.start" }, "pair.ticket");
+check(
+  "unlimited pairing mints a token with no expiry",
+  unlimitedMsg.type === "pair.ticket" && unlimitedMsg.expiresAt === null,
+);
+const unlimitedSecret = decodeTicket(unlimitedMsg.ticket).secret;
+
+const deviceA = tunnelClient(generateKeyPair(), { pairingSecret: unlimitedSecret });
+check("first device pairs on the unlimited token", (await deviceA.established) !== null);
+deviceA.close();
+
+// Same secret again — an ordinary window would now be spent; this one is not.
+const deviceB = tunnelClient(generateKeyPair(), { pairingSecret: unlimitedSecret });
+check("a second device pairs on the same unlimited token", (await deviceB.established) !== null);
+deviceB.close();
 
 daemon.kill();
 relay.kill();
