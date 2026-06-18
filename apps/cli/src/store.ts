@@ -45,21 +45,35 @@ export class ConfigStore {
     mkdirSync(dataDir, { recursive: true });
     this.path = join(dataDir, "config.json");
     this.existed = existsSync(this.path);
-    if (this.existed) {
-      try {
-        this.config = JSON.parse(readFileSync(this.path, "utf8"));
-      } catch {
-        this.config = {};
-      }
+    this.reload();
+  }
+
+  /** Re-read config.json from disk into the in-memory snapshot. */
+  private reload(): void {
+    try {
+      this.config = JSON.parse(readFileSync(this.path, "utf8"));
+    } catch {
+      this.config = {};
     }
   }
 
+  /**
+   * Always reflects what's on disk. `clawdot config` runs as a separate
+   * process and edits config.json directly, so a long-lived daemon would
+   * otherwise serve a stale snapshot (e.g. `pair.start` reporting the old
+   * pairing-window setting). Re-reading on every get keeps it live without a
+   * daemon restart; `update()` writes the whole object atomically, so disk is
+   * always the source of truth.
+   */
   get(): DaemonConfig {
+    this.reload();
     return { ...this.config };
   }
 
   /** Merge a patch; `undefined` values delete their key. */
   update(patch: Partial<Record<keyof DaemonConfig, DaemonConfig[keyof DaemonConfig] | undefined>>): void {
+    // Start from disk so we don't clobber a key another process just changed.
+    this.reload();
     for (const [key, value] of Object.entries(patch)) {
       if (value === undefined || value === "") {
         delete this.config[key as keyof DaemonConfig];

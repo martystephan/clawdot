@@ -321,11 +321,42 @@ function asBytes(data: unknown): Uint8Array {
  * a relay outage drops remote clients (they reconnect and reattach their
  * terminals, same as any other disconnect) but never touches daemon state.
  */
+export interface RelayStatus {
+  relayUrl: string;
+  connected: boolean;
+  /** Most recent failure reason; cleared on a clean connect. */
+  lastError: string | null;
+  lastErrorAt: number | null;
+  lastConnectedAt: number | null;
+  /** Consecutive failed reconnects since the last success (0 while up). */
+  attempts: number;
+}
+
 export class RelayLink {
   private ws: WebSocket | null = null;
   private channels = new Map<number, ChannelState>();
   private backoffMs = RECONNECT_MIN_MS;
   private stopped = false;
+  // Connection health, surfaced over the local socket (relay.status) so the
+  // CLI can show why remote access is down — the daemon log alone hid silent
+  // flapping (a relay that accepts then drops the socket fires no error event).
+  private connected = false;
+  private lastError: string | null = null;
+  private lastErrorAt: number | null = null;
+  private lastConnectedAt: number | null = null;
+  private attempts = 0;
+
+  /** Snapshot of the relay link's health for diagnostics. */
+  status(): RelayStatus {
+    return {
+      relayUrl: this.opts.tunnel.relayUrl,
+      connected: this.connected,
+      lastError: this.lastError,
+      lastErrorAt: this.lastErrorAt,
+      lastConnectedAt: this.lastConnectedAt,
+      attempts: this.attempts,
+    };
+  }
 
   constructor(
     private readonly opts: {
@@ -372,6 +403,10 @@ export class RelayLink {
 
     ws.on("open", () => {
       this.backoffMs = RECONNECT_MIN_MS;
+      this.connected = true;
+      this.lastConnectedAt = Date.now();
+      this.lastError = null;
+      this.attempts = 0;
       alive = true;
       heartbeat = setInterval(() => {
         if (!alive) {
@@ -392,15 +427,24 @@ export class RelayLink {
       else this.onControl(String(data));
     });
     ws.on("error", (err) => {
-      if (this.backoffMs === RECONNECT_MIN_MS) {
-        // connection-refused AggregateErrors carry an empty message
-        const reason =
-          err.message || (err as NodeJS.ErrnoException).code || "connection failed";
-        console.warn(`relay: ${reason} — retrying`);
-      }
+      // connection-refused AggregateErrors carry an empty message
+      const reason =
+        err.message || (err as NodeJS.ErrnoException).code || "connection failed";
+      this.lastError = reason;
+      this.lastErrorAt = Date.now();
+      if (this.backoffMs === RECONNECT_MIN_MS) console.warn(`relay: ${reason} — retrying`);
     });
-    ws.on("close", () => {
+    ws.on("close", (code, reason) => {
       if (heartbeat) clearInterval(heartbeat);
+      // A clean drop of an established link fires no error event — record and
+      // log it so silent flapping (connect → drop → reconnect) is visible.
+      if (this.connected) {
+        const why = reason.length ? reason.toString() : `closed (code ${code})`;
+        this.lastError = why;
+        this.lastErrorAt = Date.now();
+        console.warn(`relay: connection lost — ${why} — reconnecting`);
+      }
+      this.connected = false;
       this.onDisconnect();
     });
   }
@@ -465,6 +509,8 @@ export class RelayLink {
   }
 
   private onDisconnect(): void {
+    this.connected = false;
+    this.attempts++;
     for (const state of this.channels.values()) state.handler?.handleClose();
     this.channels.clear();
     if (this.stopped) return;

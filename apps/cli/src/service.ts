@@ -20,7 +20,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import * as p from "@clack/prompts";
 import { bailIfCancelled, requireTty } from "./cli-ui.js";
-import { DaemonClient } from "./daemon-client.js";
+import { DaemonClient, describeRelay, fetchRelayStatus } from "./daemon-client.js";
 
 const LABEL = "com.clawdot.daemon";
 
@@ -538,16 +538,23 @@ export async function runService(
         const installed = manager.installed();
         const running = installed && manager.running();
         const up = await answering(opts.port, 1);
+        const relay = up ? describeRelay(await fetchRelayStatus(opts.port)) : null;
         p.log.info(
           [
             `definition: ${installed ? manager.where : "not installed"}`,
             `service:    ${running ? "running" : "not running"}`,
             `daemon:     ${up ? `answering on ws://localhost:${opts.port}` : "not answering"}`,
+            ...(relay ? [`relay:      ${relay.text}`] : []),
           ].join("\n"),
         );
         if (installed && !running) {
           p.log.warn(
             "The definition exists but the service is not running — `clawdot service restart` will (re)load it.",
+          );
+        }
+        if (relay && !relay.ok) {
+          p.log.warn(
+            `Remote access (phone pairing) is down because the relay link isn't up. Check the relay URL in settings and that your relay host is reachable. Recent detail is in the log: ${manager.logHint}`,
           );
         }
         p.outro("Done.");

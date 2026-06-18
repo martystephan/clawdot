@@ -34,6 +34,10 @@ export async function runPair(port: number): Promise<void> {
   console.log("\n  Scan with your phone camera:\n");
   qrcode.generate(ticket.url, { small: true });
   p.log.info(`Or open:  ${ticket.url}`);
-  p.note(ticket.ticket, "Manual pairing code (paste into the app)");
+  // Print the code unboxed: a p.note() border puts a "│ " on every wrapped
+  // line, so a terminal selection drags the borders along and the pasted code
+  // is corrupted. A bare console.log gives a clean, copyable block.
+  console.log("\n  Manual pairing code (paste into the app):\n");
+  console.log(ticket.ticket);
   p.outro(`Relay: ${ticket.relayUrl}`);
 }

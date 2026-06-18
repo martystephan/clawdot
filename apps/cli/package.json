@@ -1,6 +1,6 @@
 {
   "name": "clawdot",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Run coding agents on your machine, drive them from your phone — terminal sessions over an end-to-end encrypted relay",
   "license": "MIT",
   "author": "Marty Stephan",

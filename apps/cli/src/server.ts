@@ -88,6 +88,8 @@ interface ConnectionContext {
   workspaces: WorkspaceStore;
   clients: ConnectionHub;
   tunnel: TunnelService | null;
+  /** The outbound relay connection (null when no relay is configured). */
+  relayLink: RelayLink | null;
   /** Persistent terminal sessions (daemon-scoped, survive disconnects). */
   registry: TerminalRegistry;
   config: ConfigStore;
@@ -489,6 +491,24 @@ function createConnection(
         send({ type: "device.list", devices: ctx.tunnel.listDevices() });
         break;
       }
+      case "relay.status": {
+        if (!opts.local) {
+          send({ type: "error", message: "relay status can only be read locally" });
+          return;
+        }
+        const s = ctx.relayLink?.status() ?? null;
+        send({
+          type: "relay.status",
+          configured: !!ctx.tunnel,
+          relayUrl: s?.relayUrl ?? ctx.tunnel?.relayUrl ?? null,
+          connected: s?.connected ?? false,
+          lastError: s?.lastError ?? null,
+          lastErrorAt: s?.lastErrorAt ?? null,
+          lastConnectedAt: s?.lastConnectedAt ?? null,
+          attempts: s?.attempts ?? 0,
+        });
+        break;
+      }
     }
   };
 
@@ -541,6 +561,7 @@ export function startServer(opts: {
     workspaces,
     clients,
     tunnel,
+    relayLink: null, // filled in below once the link is constructed
     registry,
     config,
     browser: new BrowserManager(opts.dataDir),
@@ -606,6 +627,7 @@ export function startServer(opts: {
         createConnection(ctx, send, { local: false, deviceKey }),
       onPushDead: (tokens) => tunnel.prunePushTokens(tokens),
     });
+    ctx.relayLink = relayLink;
     relayLink.start();
   }
 

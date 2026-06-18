@@ -351,6 +351,12 @@ export const ClientMessage = z.discriminatedUnion("type", [
    */
   z.object({ type: z.literal("device.revoke"), key: z.string() }),
   /**
+   * Ask the daemon for the health of its outbound relay link (connected,
+   * last error, reconnect attempts). Local socket only, like pair.start —
+   * it's a diagnostic for the CLI, not something remote clients need.
+   */
+  z.object({ type: z.literal("relay.status") }),
+  /**
    * Register this device's push token so the daemon can notify it when an
    * agent needs attention while the app is backgrounded. Carried inside the
    * E2E channel, so the token is associated with the channel's authenticated
@@ -408,6 +414,22 @@ export const ServerMessage = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("device.list"),
     devices: z.array(DeviceMeta),
+  }),
+  /**
+   * Response to relay.status — the daemon's outbound relay link health.
+   * `configured` is false when no relay is set (remote access off). Times are
+   * unix ms; `attempts` counts consecutive failed reconnects since the last
+   * successful connect (0 while connected).
+   */
+  z.object({
+    type: z.literal("relay.status"),
+    configured: z.boolean(),
+    relayUrl: z.string().nullable(),
+    connected: z.boolean(),
+    lastError: z.string().nullable(),
+    lastErrorAt: z.number().nullable(),
+    lastConnectedAt: z.number().nullable(),
+    attempts: z.number(),
   }),
   /** Response to terminal.open. `cwd` is the directory the shell started in. */
   z.object({
