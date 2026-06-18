@@ -2,7 +2,7 @@
 // End-to-end test: daemon over a real WebSocket.
 // Verifies workspace tracking, filesystem browsing, ephemeral and persistent
 // terminals (PTY round trip, scrollback replay, multi-device attach),
-// settings, the web preview proxy (HTTP + WebSocket forwarding), and
+// settings, the remote browser (headless Chromium streamed via browser.*), and
 // persistence of workspaces/settings across a daemon restart.
 // Run via `pnpm --filter @clawdot/cli test`.
 import { spawn } from "node:child_process";
@@ -11,7 +11,6 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { WebSocketServer } from "ws";
 import { PROTOCOL_VERSION } from "@clawdot/protocol";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -394,422 +393,140 @@ check("attaching a dead terminal is a scoped error", gone.message.length > 0);
 p2.close();
 sObserver.close();
 
-// --- Scenario 5: web preview proxy (HTTP + WebSocket forwarding) ---------------
-// A fake dev server standing in for Vite & co: one HTTP route with headers
-// the daemon must strip, an echoing POST route, and a WebSocket echo.
-const target = createServer((req, res) => {
-  if (req.url === "/hello") {
-    res.writeHead(200, {
-      "content-type": "text/plain",
-      "x-dev-server": "yes",
-      "content-security-policy": "default-src 'none'",
-      "x-frame-options": "DENY",
-    });
-    res.end("preview says hi");
-  } else if (req.url === "/echo" && req.method === "POST") {
-    const parts = [];
-    req.on("data", (d) => parts.push(d));
-    req.on("end", () => {
-      res.writeHead(200, { "content-type": "application/octet-stream" });
-      res.end(Buffer.concat(parts));
-    });
-  } else if (req.url === "/login") {
-    // A cookie-session app: /login mints the session, /me requires it.
-    res.writeHead(200, { "set-cookie": "session=abc123; Path=/; HttpOnly" });
-    res.end("logged in");
-  } else if (req.url === "/logout") {
-    res.writeHead(200, { "set-cookie": "session=; Path=/; Max-Age=0" });
-    res.end("logged out");
-  } else if (req.url === "/me") {
-    if ((req.headers.cookie ?? "").includes("session=abc123")) {
-      res.writeHead(200);
-      res.end("hello user");
-    } else {
-      res.writeHead(401);
-      res.end("no session");
-    }
-  } else if (req.url === "/whoami") {
-    res.writeHead(200);
-    res.end(req.headers.cookie ?? "none");
-  } else if (req.url === "/origin-echo") {
-    res.writeHead(200);
-    res.end(`${req.headers.origin ?? "none"} ${req.headers.referer ?? "none"}`);
-  } else {
-    res.writeHead(404);
-    res.end("nope");
-  }
-});
-new WebSocketServer({ server: target }).on("connection", (sock, req) => {
-  // /cookie announces the handshake's cookie header so the jar is testable.
-  if (req.url === "/cookie") sock.send(req.headers.cookie ?? "none");
-  sock.on("message", (data) => sock.send(`echo:${data}`));
-});
-await new Promise((resolve) => target.listen(0, "127.0.0.1", resolve));
-const targetPort = target.address().port;
-process.on("exit", () => target.close());
-
-const pv = connect();
-await pv.open();
-
-const headP = pv.next((m) => m.type === "preview.head" && m.requestId === "r1", "preview.head");
-const endP = pv.next((m) => m.type === "preview.end" && m.requestId === "r1", "preview.end");
-pv.send({
-  type: "preview.fetch",
-  requestId: "r1",
-  port: targetPort,
-  method: "GET",
-  path: "/hello",
-  headers: [["accept", "text/plain"]],
-});
-const head = await headP;
-await endP;
-const body = Buffer.concat(
-  pv.messages
-    .filter((m) => m.type === "preview.body" && m.requestId === "r1")
-    .map((m) => Buffer.from(m.chunk, "base64")),
-).toString();
-check(
-  "preview.fetch proxies a local http server and streams the body",
-  head.status === 200 &&
-    head.headers.some(([k, v]) => k === "x-dev-server" && v === "yes") &&
-    body === "preview says hi",
-);
-check(
-  "frame-blocking and framing headers are stripped from the response",
-  !head.headers.some(([k]) =>
-    ["content-security-policy", "x-frame-options", "content-length"].includes(k),
-  ),
-);
-
-const echoHeadP = pv.next((m) => m.type === "preview.head" && m.requestId === "r2", "echo head");
-const echoEndP = pv.next((m) => m.type === "preview.end" && m.requestId === "r2", "echo end");
-pv.send({
-  type: "preview.fetch",
-  requestId: "r2",
-  port: targetPort,
-  method: "POST",
-  path: "/echo",
-  headers: [],
-  body: Buffer.from("round trip").toString("base64"),
-});
-await echoHeadP;
-await echoEndP;
-const echoBody = Buffer.concat(
-  pv.messages
-    .filter((m) => m.type === "preview.body" && m.requestId === "r2")
-    .map((m) => Buffer.from(m.chunk, "base64")),
-).toString();
-check("preview.fetch carries request bodies to the target", echoBody === "round trip");
-
-// Vite bound to `localhost` often listens on ::1 ONLY (macOS) — the proxy
-// must fall back from 127.0.0.1 to the IPv6 loopback.
-const v6Target = createServer((_req, res) => {
-  res.writeHead(200, { "content-type": "text/plain" });
-  res.end("v6 only");
-});
-new WebSocketServer({ server: v6Target }).on("connection", (sock) => {
-  sock.on("message", (data) => sock.send(`v6:${data}`));
-});
-await new Promise((resolve) => v6Target.listen(0, "::1", resolve));
-const v6Port = v6Target.address().port;
-process.on("exit", () => v6Target.close());
-
-const v6EndP = pv.next((m) => m.type === "preview.end" && m.requestId === "r6", "v6 end");
-pv.send({
-  type: "preview.fetch",
-  requestId: "r6",
-  port: v6Port,
-  method: "GET",
-  path: "/",
-  headers: [],
-});
-await v6EndP;
-const v6Body = Buffer.concat(
-  pv.messages
-    .filter((m) => m.type === "preview.body" && m.requestId === "r6")
-    .map((m) => Buffer.from(m.chunk, "base64")),
-).toString();
-check("preview.fetch falls back to the ::1 loopback (Vite on macOS)", v6Body === "v6 only");
-
-const v6WsOpenedP = pv.next(
-  (m) => m.type === "preview.ws.opened" && m.socketId === "s6",
-  "v6 ws opened",
-);
-pv.send({ type: "preview.ws.open", socketId: "s6", port: v6Port, path: "/" });
-await v6WsOpenedP;
-const v6WsMsgP = pv.next(
-  (m) => m.type === "preview.ws.message" && m.socketId === "s6",
-  "v6 ws message",
-);
-pv.send({
-  type: "preview.ws.send",
-  socketId: "s6",
-  data: Buffer.from("hi").toString("base64"),
-  binary: false,
-});
-const v6WsMsg = await v6WsMsgP;
-check(
-  "preview websocket falls back to the ::1 loopback too",
-  Buffer.from(v6WsMsg.data, "base64").toString() === "v6:hi",
-);
-pv.send({ type: "preview.ws.close", socketId: "s6" });
-
-// A port nothing listens on (bound once to find a free one, then released)
-// must be a scoped error.
-const freeProbe = createServer();
-await new Promise((resolve) => freeProbe.listen(0, resolve));
-const deadPort = freeProbe.address().port;
-await new Promise((resolve) => freeProbe.close(resolve));
-
-const errP = pv.next((m) => m.type === "preview.error" && m.requestId === "r3", "preview.error");
-pv.send({
-  type: "preview.fetch",
-  requestId: "r3",
-  port: deadPort,
-  method: "GET",
-  path: "/",
-  headers: [],
-});
-const fetchErr = await errP;
-check("a dead port is a scoped preview.error, not a hang", fetchErr.message.length > 0);
-
-const wsOpenedP = pv.next((m) => m.type === "preview.ws.opened" && m.socketId === "s1", "ws opened");
-pv.send({ type: "preview.ws.open", socketId: "s1", port: targetPort, path: "/" });
-await wsOpenedP;
-const wsMsgP = pv.next((m) => m.type === "preview.ws.message" && m.socketId === "s1", "ws message");
-pv.send({
-  type: "preview.ws.send",
-  socketId: "s1",
-  data: Buffer.from("hmr").toString("base64"),
-  binary: false,
-});
-const wsMsg = await wsMsgP;
-check(
-  "preview websocket round-trips through the daemon",
-  Buffer.from(wsMsg.data, "base64").toString() === "echo:hmr" && wsMsg.binary === false,
-);
-const wsClosedP = pv.next((m) => m.type === "preview.ws.closed" && m.socketId === "s1", "ws closed");
-pv.send({ type: "preview.ws.close", socketId: "s1", code: 1000 });
-const wsClosed = await wsClosedP;
-check("preview websocket closes cleanly", wsClosed.code === 1000);
-
-const wsFailP = pv.next((m) => m.type === "preview.ws.closed" && m.socketId === "s2", "ws fail");
-pv.send({ type: "preview.ws.open", socketId: "s2", port: deadPort, path: "/" });
-await wsFailP;
-check("a websocket to a dead port reports preview.ws.closed", true);
-
-// Absolute-url fetches: refusing hosts off the allowlist is what keeps the
-// daemon from being an open proxy, so test the refusal BEFORE allowing.
-const urlDeniedP = pv.next(
-  (m) => m.type === "preview.error" && m.requestId === "r4",
-  "url denied",
-);
-pv.send({
-  type: "preview.fetch",
-  requestId: "r4",
-  port: targetPort,
-  method: "GET",
-  path: "/hello",
-  url: `http://127.0.0.1:${targetPort}/hello`,
-  headers: [],
-});
-const denied = await urlDeniedP;
-check(
-  "an absolute-url fetch to a non-allowlisted host is refused",
-  denied.message.includes("not allowed"),
-);
-
-const hostsBroadcastP = pv.next(
-  (m) => m.type === "settings" && m.previewAllowedHosts.length === 2,
-  "allowlist broadcast",
-);
-pv.send({
-  type: "settings.update",
-  terminalAgents: [{ name: "Echo", command: "echo hi" }],
-  previewAllowedHosts: ["127.0.0.1", "API.Example.COM"],
-});
-const hostsSettings = await hostsBroadcastP;
-check(
-  "settings.update normalizes and broadcasts the preview allowlist",
-  hostsSettings.previewAllowedHosts.includes("127.0.0.1") &&
-    hostsSettings.previewAllowedHosts.includes("api.example.com"),
-);
-
-const urlHeadP = pv.next((m) => m.type === "preview.head" && m.requestId === "r5", "url head");
-const urlEndP = pv.next((m) => m.type === "preview.end" && m.requestId === "r5", "url end");
-pv.send({
-  type: "preview.fetch",
-  requestId: "r5",
-  port: targetPort,
-  method: "GET",
-  path: "/hello",
-  url: `http://127.0.0.1:${targetPort}/hello`,
-  headers: [],
-});
-const urlHead = await urlHeadP;
-await urlEndP;
-const urlBody = Buffer.concat(
-  pv.messages
-    .filter((m) => m.type === "preview.body" && m.requestId === "r5")
-    .map((m) => Buffer.from(m.chunk, "base64")),
-).toString();
-check(
-  "an allowlisted host serves absolute-url fetches",
-  urlHead.status === 200 && urlBody === "preview says hi",
-);
-
-// --- Cookie jar: the daemon holds previewed apps' sessions (the browser
-// can't — service-worker responses can't set cookies). ---------------------
-let cookieReq = 0;
-const previewGet = async (conn, port, path) => {
-  const id = `rc${cookieReq++}`;
-  const headP = conn.next(
-    (m) => m.type === "preview.head" && m.requestId === id,
-    `head ${path}`,
+// --- Scenario 5: remote browser (headless Chromium streamed) -------------------
+// A real browser tab on the daemon's machine, streamed as JPEG frames. Needs a
+// Chrome to drive; with downloads disabled (set below) a machine without one
+// reports browser.closed and we skip the streaming checks rather than fail.
+const page = createServer((_req, res) => {
+  res.writeHead(200, { "content-type": "text/html" });
+  res.end(
+    "<!doctype html><html><head><title>Clawdot Preview Test</title></head>" +
+      "<body><h1 id='h'>hello browser</h1></body></html>",
   );
-  const endP = conn.next(
-    (m) => m.type === "preview.end" && m.requestId === id,
-    `end ${path}`,
+});
+await new Promise((resolve) => page.listen(0, "127.0.0.1", resolve));
+const pagePort = page.address().port;
+
+const bw = connect();
+await bw.open();
+const openResultP = bw.next(
+  (m) =>
+    (m.type === "browser.opened" || m.type === "browser.closed") &&
+    m.sessionId === "b1",
+  "browser.opened",
+);
+bw.send({
+  type: "browser.open",
+  sessionId: "b1",
+  port: pagePort,
+  width: 800,
+  height: 600,
+  dpr: 1,
+});
+const openResult = await openResultP;
+if (openResult.type === "browser.closed") {
+  console.log(
+    `skip - remote browser (no Chrome available: ${openResult.message ?? "?"})`,
   );
-  conn.send({
-    type: "preview.fetch",
-    requestId: id,
-    port,
-    method: "GET",
-    path,
-    headers: [],
+} else {
+  const frame = await bw.next(
+    (m) => m.type === "browser.frame" && m.sessionId === "b1",
+    "browser.frame",
+  );
+  check(
+    "the daemon streams JPEG screencast frames",
+    typeof frame.data === "string" &&
+      frame.data.length > 0 &&
+      frame.meta.deviceWidth > 0,
+  );
+
+  const evalResP = bw.next(
+    (m) => m.type === "browser.eval.result" && m.requestId === "e1",
+    "browser.eval.result",
+  );
+  bw.send({
+    type: "browser.eval",
+    sessionId: "b1",
+    requestId: "e1",
+    expression: "document.title",
   });
-  const head = await headP;
-  await endP;
-  const body = Buffer.concat(
-    conn.messages
-      .filter((m) => m.type === "preview.body" && m.requestId === id)
-      .map((m) => Buffer.from(m.chunk, "base64")),
-  ).toString();
-  return { head, body };
-};
+  const evalRes = await evalResP;
+  check(
+    "browser.eval reads the live (server-side) DOM",
+    evalRes.ok === true && JSON.parse(evalRes.value) === "Clawdot Preview Test",
+  );
 
-const meBefore = await previewGet(pv, targetPort, "/me");
-check("a cookie-session route 401s before login", meBefore.head.status === 401);
+  const domResP = bw.next(
+    (m) => m.type === "browser.dom" && m.requestId === "d1",
+    "browser.dom",
+  );
+  bw.send({ type: "browser.dom", sessionId: "b1", requestId: "d1" });
+  const domRes = await domResP;
+  check(
+    "browser.dom returns the serialized document",
+    domRes.html.includes("hello browser"),
+  );
 
-const login = await previewGet(pv, targetPort, "/login");
-check(
-  "set-cookie is captured into the jar and still stripped from the client",
-  login.head.status === 200 &&
-    !login.head.headers.some(([k]) => k === "set-cookie"),
-);
+  // A second concurrent tab on a DIFFERENT page proves sessions are independent.
+  const page2 = createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "text/html" });
+    res.end(
+      "<!doctype html><html><head><title>Second Tab</title></head><body>two</body></html>",
+    );
+  });
+  await new Promise((resolve) => page2.listen(0, "127.0.0.1", resolve));
+  const page2Port = page2.address().port;
+  const opened2P = bw.next(
+    (m) => m.type === "browser.opened" && m.sessionId === "b2",
+    "browser.opened b2",
+  );
+  bw.send({
+    type: "browser.open",
+    sessionId: "b2",
+    port: page2Port,
+    width: 640,
+    height: 480,
+    dpr: 1,
+  });
+  await opened2P;
+  await bw.next(
+    (m) => m.type === "browser.frame" && m.sessionId === "b2",
+    "browser.frame b2",
+  );
+  const eval2P = bw.next(
+    (m) => m.type === "browser.eval.result" && m.requestId === "e2",
+    "browser.eval.result b2",
+  );
+  bw.send({
+    type: "browser.eval",
+    sessionId: "b2",
+    requestId: "e2",
+    expression: "document.title",
+  });
+  const eval2 = await eval2P;
+  check(
+    "concurrent sessions stream independent tabs on different URLs",
+    eval2.ok === true && JSON.parse(eval2.value) === "Second Tab",
+  );
 
-const meAfter = await previewGet(pv, targetPort, "/me");
-check(
-  "the jar replays the session on the next request",
-  meAfter.head.status === 200 && meAfter.body === "hello user",
-);
+  // Pause a tab, then resume — resuming repaints from the last frame at once.
+  bw.send({ type: "browser.setActive", sessionId: "b1", active: false });
+  const resumeP = bw.next(
+    (m) => m.type === "browser.frame" && m.sessionId === "b1",
+    "browser.frame b1 resume",
+  );
+  bw.send({ type: "browser.setActive", sessionId: "b1", active: true });
+  const resumed = await resumeP;
+  check(
+    "browser.setActive resume repaints a backgrounded tab immediately",
+    typeof resumed.data === "string" && resumed.data.length > 0,
+  );
 
-// The session rides WebSocket handshakes too (Socket.IO-style cookie auth).
-const wsCookieP = pv.next(
-  (m) => m.type === "preview.ws.message" && m.socketId === "s7",
-  "ws cookie",
-);
-pv.send({ type: "preview.ws.open", socketId: "s7", port: targetPort, path: "/cookie" });
-const wsCookie = await wsCookieP;
-check(
-  "the jar replays the session on websocket handshakes",
-  Buffer.from(wsCookie.data, "base64").toString().includes("session=abc123"),
-);
-pv.send({ type: "preview.ws.close", socketId: "s7" });
-
-// Isolation: a different port must never see another app's session.
-const otherTarget = createServer((req, res) => {
-  res.writeHead(200);
-  res.end(req.headers.cookie ?? "none");
-});
-await new Promise((resolve) => otherTarget.listen(0, "127.0.0.1", resolve));
-const otherPort = otherTarget.address().port;
-const leak = await previewGet(pv, otherPort, "/whoami");
-check("cookies never leak to a different port", leak.body === "none");
-
-// The jar is daemon-scoped: a reconnecting phone keeps the app's session.
-const pvAgain = connect();
-await pvAgain.open();
-const meOther = await previewGet(pvAgain, targetPort, "/me");
-check(
-  "the session survives a reconnect (jar is daemon-scoped, not per-connection)",
-  meOther.head.status === 200,
-);
-pvAgain.close();
-
-await previewGet(pv, targetPort, "/logout");
-const meLoggedOut = await previewGet(pv, targetPort, "/me");
-check("Max-Age=0 logs the session out of the jar", meLoggedOut.head.status === 401);
-
-// Origin/Referer synthesis: service workers never see these headers (the
-// browser attaches them below the worker), so the daemon must emulate the
-// browser's rules from pagePort alone — Origin on non-GET/HEAD requests
-// (what CSRF checks like Better Auth's care about), Referer on everything.
-const originHeadP = pv.next(
-  (m) => m.type === "preview.head" && m.requestId === "r7",
-  "origin-echo head",
-);
-const originEndP = pv.next(
-  (m) => m.type === "preview.end" && m.requestId === "r7",
-  "origin-echo end",
-);
-pv.send({
-  type: "preview.fetch",
-  requestId: "r7",
-  port: targetPort,
-  method: "POST",
-  path: "/origin-echo",
-  pagePort: 5173,
-  headers: [],
-});
-await originHeadP;
-await originEndP;
-const originEcho = Buffer.concat(
-  pv.messages
-    .filter((m) => m.type === "preview.body" && m.requestId === "r7")
-    .map((m) => Buffer.from(m.chunk, "base64")),
-).toString();
-check(
-  "POSTs with pagePort carry synthesized localhost Origin/Referer",
-  originEcho === "http://localhost:5173 http://localhost:5173/",
-);
-
-const getHeadP = pv.next(
-  (m) => m.type === "preview.head" && m.requestId === "r8",
-  "origin-echo get head",
-);
-const getEndP = pv.next(
-  (m) => m.type === "preview.end" && m.requestId === "r8",
-  "origin-echo get end",
-);
-pv.send({
-  type: "preview.fetch",
-  requestId: "r8",
-  port: targetPort,
-  method: "GET",
-  path: "/origin-echo",
-  pagePort: 5173,
-  headers: [],
-});
-await getHeadP;
-await getEndP;
-const getEcho = Buffer.concat(
-  pv.messages
-    .filter((m) => m.type === "preview.body" && m.requestId === "r8")
-    .map((m) => Buffer.from(m.chunk, "base64")),
-).toString();
-check(
-  "GETs with pagePort get Referer but no Origin (browser behavior)",
-  getEcho === "none http://localhost:5173/",
-);
-
-const bareEcho = await previewGet(pv, targetPort, "/origin-echo");
-check(
-  "without pagePort nothing is invented",
-  bareEcho.body === "none none",
-);
-pv.close();
+  bw.send({ type: "browser.close", sessionId: "b1" });
+  bw.send({ type: "browser.close", sessionId: "b2" });
+  page2.close();
+}
+bw.close();
 
 // --- Scenario 6: daemon restart → workspaces and settings survive --------------
 await stopDaemon();
@@ -841,10 +558,6 @@ check(
   settings2.terminalAgents.length === 1 &&
     settings2.terminalAgents[0].name === "Echo",
 );
-check(
-  "the preview allowlist survived the restart",
-  settings2.previewAllowedHosts.includes("127.0.0.1"),
-);
 
 const termList2P = c2.next((m) => m.type === "terminal.list", "terminal.list restart");
 c2.send({ type: "terminal.list" });
@@ -856,11 +569,9 @@ check(
 c2.close();
 
 await stopDaemon();
-// The exit hook can't do this: listening servers hold the event loop open,
-// so "exit" would never fire and the process would hang after the summary.
-target.close();
-v6Target.close();
-otherTarget.close();
+// A listening server holds the event loop open, so the "exit" hook would never
+// fire and the process would hang after the summary — close it explicitly.
+page.close();
 if (failures.length) {
   console.error(`\n${failures.length} check(s) failed`);
   process.exit(1);

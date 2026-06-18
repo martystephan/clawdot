@@ -18,8 +18,6 @@ export interface DaemonConfig {
   port?: number;
   /** Commands launchable as terminal sessions (settings dialog in the app). */
   terminalAgents?: TerminalAgent[];
-  /** Hostnames the preview proxy may fetch beyond loopback (settings dialog). */
-  previewAllowedHosts?: string[];
   /** Push a notification when an unwatched agent rings the bell. Default true. */
   notifyOnBell?: boolean;
   /**

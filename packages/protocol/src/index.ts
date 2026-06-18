@@ -26,22 +26,21 @@
  *   without typing absolute paths.
  * - `pair.*` / `device.*` are local-socket-only: remote clients must never
  *   mint tickets or manage trusted devices.
- * - `preview.*` proxies HTTP and WebSocket traffic to servers on the daemon's
- *   machine (loopback by default — the daemon is a port forwarder, not a
- *   general proxy; the one exception is `preview.fetch` with an absolute
- *   `url`, which the daemon serves ONLY for hostnames the user explicitly
- *   allowlisted in settings), so the app can render a live web preview of a
- *   dev server through the same E2E-encrypted connection. The client drives
- *   it: a service worker turns iframe requests into `preview.fetch`, and a
- *   shim injected into preview documents turns their WebSockets (Vite HMR)
- *   into `preview.ws.*`. Bodies travel base64-encoded; responses stream as
- *   head/body/end so large assets never need one giant message.
+ * - `browser.*` drives a REAL headless Chromium running on the daemon's
+ *   machine (one tab per session) and streams it to the app. The page
+ *   genuinely executes server-side — its requests originate from the
+ *   daemon's host, with the daemon's IP/DNS/cookies — so a previewed dev
+ *   server (or any site) can't tell it's being viewed from a phone, and
+ *   there is no CORS/SSRF/service-worker glue. The daemon screencasts the
+ *   tab as `browser.frame` (base64 JPEG) and the client sends `browser.input`
+ *   (mouse/wheel/keys) back; `browser.eval`/`browser.dom` expose the live DOM
+ *   to the app. This replaced an earlier service-worker HTTP/WS proxy.
  * - further `surface.*` events (test panels, …) will be added later and
  *   must never require changes to the transport layer.
  */
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = 17;
+export const PROTOCOL_VERSION = 18;
 
 /** An FCM/APNs registration token, as obtained on the device. */
 export const PushToken = z.string().min(1).max(4096);
@@ -84,31 +83,70 @@ export type TerminalAgent = z.infer<typeof TerminalAgent>;
 
 export const MAX_TERMINAL_AGENTS = 20;
 
+// --- Remote browser (browser.*) building blocks -------------------------
+
+/** Identifies one headless-browser tab for the lifetime of a connection. */
+const browserId = z.string().min(1).max(128);
+/** Correlates a browser.eval/browser.dom request with its reply. */
+const browserReqId = z.string().min(1).max(128);
+const browserPort = z.number().int().min(1).max(65535);
+/** Viewport / device-scale bounds for the emulated tab. */
+const viewportDim = z.number().int().min(1).max(8192);
+const devicePixelRatio = z.number().min(0.5).max(4);
+
 /**
- * A hostname the daemon may fetch for previews beyond loopback ("api.example.com",
- * an IP). Hostname only — it matches any port and any of http/https.
+ * One input event for the remote tab, produced from a DOM pointer/keyboard
+ * event on the client and dispatched verbatim via CDP. Coordinates are CSS
+ * pixels in the tab's viewport (the client maps them from the rendered frame).
  */
-export const PreviewAllowedHost = z
-  .string()
-  .min(1)
-  .max(253)
-  .regex(/^[a-z0-9_]([a-z0-9._-]*[a-z0-9_])?$/i);
+export const BrowserInput = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("mouse"),
+    type: z.enum(["mousePressed", "mouseReleased", "mouseMoved"]),
+    x: z.number(),
+    y: z.number(),
+    button: z.enum(["none", "left", "middle", "right"]),
+    buttons: z.number().int().min(0).max(31).optional(),
+    clickCount: z.number().int().min(0).max(3).optional(),
+    modifiers: z.number().int().min(0).max(15).optional(),
+  }),
+  z.object({
+    kind: z.literal("wheel"),
+    x: z.number(),
+    y: z.number(),
+    deltaX: z.number(),
+    deltaY: z.number(),
+    modifiers: z.number().int().min(0).max(15).optional(),
+  }),
+  z.object({
+    kind: z.literal("key"),
+    type: z.enum(["keyDown", "keyUp", "rawKeyDown", "char"]),
+    key: z.string().max(64).optional(),
+    code: z.string().max(64).optional(),
+    text: z.string().max(8).optional(),
+    windowsVirtualKeyCode: z.number().int().min(0).max(255).optional(),
+    modifiers: z.number().int().min(0).max(15).optional(),
+  }),
+  // Paste: insert a whole string into the focused element at once (CDP
+  // Input.insertText), instead of replaying it as individual keystrokes.
+  z.object({
+    kind: z.literal("text"),
+    text: z.string().max(100_000),
+  }),
+]);
+export type BrowserInput = z.infer<typeof BrowserInput>;
 
-export const MAX_PREVIEW_ALLOWED_HOSTS = 50;
-
-/**
- * HTTP headers as ordered name/value pairs (a record can't carry repeated
- * names like multiple `set-cookie`s, and order is occasionally meaningful).
- */
-export const HeaderPairs = z.array(
-  z.tuple([z.string().max(256), z.string().max(8192)]),
-);
-export type HeaderPairs = z.infer<typeof HeaderPairs>;
-
-const previewId = z.string().min(1).max(128);
-const previewPort = z.number().int().min(1).max(65535);
-/** Request path including query string, as the target server should see it. */
-const previewPath = z.string().min(1).max(8192).regex(/^\//);
+/** Screencast frame geometry, forwarded from CDP so the client can map input. */
+export const BrowserFrameMeta = z.object({
+  /** Page width/height in CSS pixels (the emulated viewport). */
+  deviceWidth: z.number(),
+  deviceHeight: z.number(),
+  pageScaleFactor: z.number(),
+  offsetTop: z.number(),
+  scrollOffsetX: z.number(),
+  scrollOffsetY: z.number(),
+});
+export type BrowserFrameMeta = z.infer<typeof BrowserFrameMeta>;
 
 /** A persistent terminal session, as returned by terminal.list. */
 export const TerminalMeta = z.object({
@@ -223,72 +261,81 @@ export const ClientMessage = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("settings.update"),
     terminalAgents: z.array(TerminalAgent).max(MAX_TERMINAL_AGENTS),
-    /** Hosts the preview proxy may fetch beyond loopback. Omitted = keep. */
-    previewAllowedHosts: z
-      .array(PreviewAllowedHost)
-      .max(MAX_PREVIEW_ALLOWED_HOSTS)
-      .optional(),
     /** Push a notification when an agent rings the bell while unwatched. Omitted = keep. */
     notifyOnBell: z.boolean().optional(),
   }),
   /**
-   * Proxy one HTTP request to loopback `<port><path>` on the daemon's
-   * machine. The response streams back as preview.head, then preview.body
-   * chunks, then preview.end (or preview.error at any point). In-flight
-   * requests die with the connection. With `url` set, the daemon instead
-   * fetches that absolute http(s) URL — but only if its hostname is on the
-   * user's preview allowlist (settings) — so previewed apps can reach APIs
-   * the phone's browser can't (CORS, private networks). `port`/`path` then
-   * just carry the preview context.
+   * Open a headless-browser tab on the daemon's machine and start streaming
+   * it. Navigates to loopback `http://localhost:<port>/` (a dev server on the
+   * daemon's host) unless an absolute `url` is given. Replies browser.opened,
+   * then a stream of browser.frame; browser.closed on failure. The tab is
+   * owned by this connection and closes with it.
    */
   z.object({
-    type: z.literal("preview.fetch"),
-    requestId: previewId,
-    port: previewPort,
-    method: z.string().min(1).max(20),
-    path: previewPath,
-    headers: HeaderPairs.max(128),
-    /** Absolute target URL for an allowlisted external fetch. */
+    type: z.literal("browser.open"),
+    sessionId: browserId,
+    port: browserPort.optional(),
     url: z.string().url().max(8192).optional(),
-    /**
-     * The previewed page's own port. The daemon rewrites Origin/Referer to
-     * `http://localhost:<pagePort>` — exactly what the target would see if
-     * the user browsed locally — so origin-checking backends (Better Auth
-     * CSRF checks, CORS allowlists pinned to localhost) behave identically
-     * in the preview. Forwarding the real preview-origin headers would trip
-     * them; stripping them entirely trips strict ones too.
-     */
-    pagePort: previewPort.optional(),
-    /** base64 request body (uploads, form posts). */
-    body: z.string().max(14_000_000).optional(),
+    width: viewportDim,
+    height: viewportDim,
+    dpr: devicePixelRatio,
   }),
-  /** Cancel an in-flight preview.fetch (the viewer navigated away). */
-  z.object({ type: z.literal("preview.abort"), requestId: previewId }),
+  /** Navigate an open tab (address bar). */
+  z.object({
+    type: z.literal("browser.navigate"),
+    sessionId: browserId,
+    url: z.string().url().max(8192),
+  }),
+  /** Browser-chrome navigation: history back/forward and reload. */
+  z.object({
+    type: z.literal("browser.action"),
+    sessionId: browserId,
+    action: z.enum(["back", "forward", "reload"]),
+  }),
+  /** One input event (mouse/wheel/key) for the tab. */
+  z.object({
+    type: z.literal("browser.input"),
+    sessionId: browserId,
+    event: BrowserInput,
+  }),
+  /** Resize the emulated viewport (panel resize / device rotation). */
+  z.object({
+    type: z.literal("browser.resize"),
+    sessionId: browserId,
+    width: viewportDim,
+    height: viewportDim,
+    dpr: devicePixelRatio,
+  }),
   /**
-   * Open a WebSocket to loopback `<port><path>` on the daemon's
-   * machine (service workers can't intercept WebSockets, so a shim in the
-   * preview document routes them here). Replies preview.ws.opened on
-   * success, preview.ws.closed otherwise. Sockets die with the connection.
+   * Pause/resume frame delivery without closing the tab. A backgrounded view
+   * (the user switched to another session) sets active:false so the daemon
+   * keeps the page running but stops streaming frames over the link; resuming
+   * pushes the current frame immediately so the view repaints at once.
    */
   z.object({
-    type: z.literal("preview.ws.open"),
-    socketId: previewId,
-    port: previewPort,
-    path: previewPath,
-    protocols: z.array(z.string().min(1).max(128)).max(16).optional(),
+    type: z.literal("browser.setActive"),
+    sessionId: browserId,
+    active: z.boolean(),
   }),
-  /** One WebSocket message toward the target server; data is base64. */
+  /**
+   * Evaluate a JS expression in the tab's page context and reply with
+   * browser.eval.result. This is the DOM-access path: the app can query or
+   * mutate the live (server-side) DOM. Result must be JSON-serializable.
+   */
   z.object({
-    type: z.literal("preview.ws.send"),
-    socketId: previewId,
-    data: z.string().max(14_000_000),
-    binary: z.boolean(),
+    type: z.literal("browser.eval"),
+    sessionId: browserId,
+    requestId: browserReqId,
+    expression: z.string().min(1).max(1_000_000),
   }),
+  /** Snapshot the tab's serialized DOM; replies browser.dom. */
   z.object({
-    type: z.literal("preview.ws.close"),
-    socketId: previewId,
-    code: z.number().int().min(1000).max(4999).optional(),
+    type: z.literal("browser.dom"),
+    sessionId: browserId,
+    requestId: browserReqId,
   }),
+  /** Close the tab (panel closed / port changed). */
+  z.object({ type: z.literal("browser.close"), sessionId: browserId }),
   /**
    * Start a pairing window: the daemon mints a one-time secret and replies
    * with pair.ticket. Sent by `clawdot pair` over the local socket; remote
@@ -392,8 +439,6 @@ export const ServerMessage = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("settings"),
     terminalAgents: z.array(TerminalAgent),
-    /** Hosts the preview proxy may fetch beyond loopback. */
-    previewAllowedHosts: z.array(z.string()),
     /** Whether a terminal bell on an unwatched session pushes a notification. */
     notifyOnBell: z.boolean(),
   }),
@@ -414,44 +459,52 @@ export const ServerMessage = z.discriminatedUnion("type", [
     terminalId: z.string().nullable(),
     message: z.string(),
   }),
-  /**
-   * Response status + headers for a preview.fetch. Hop-by-hop and
-   * framing-sensitive headers (content-length/-encoding) are already
-   * stripped daemon-side, as are frame-blocking ones (CSP, x-frame-options)
-   * — the whole point is rendering the page inside the app.
-   */
+  /** The tab opened and is now streaming. */
   z.object({
-    type: z.literal("preview.head"),
-    requestId: previewId,
-    status: z.number().int().min(100).max(599),
-    headers: HeaderPairs,
+    type: z.literal("browser.opened"),
+    sessionId: browserId,
+    url: z.string(),
+    title: z.string(),
   }),
-  /** One base64 chunk of the response body, in order. */
+  /** One screencast frame: base64 JPEG plus the geometry to map input. */
   z.object({
-    type: z.literal("preview.body"),
-    requestId: previewId,
-    chunk: z.string(),
-  }),
-  z.object({ type: z.literal("preview.end"), requestId: previewId }),
-  /** The request failed (before or mid-body) — e.g. nothing listens there. */
-  z.object({
-    type: z.literal("preview.error"),
-    requestId: previewId,
-    message: z.string(),
-  }),
-  z.object({ type: z.literal("preview.ws.opened"), socketId: previewId }),
-  /** One WebSocket message from the target server; data is base64. */
-  z.object({
-    type: z.literal("preview.ws.message"),
-    socketId: previewId,
+    type: z.literal("browser.frame"),
+    sessionId: browserId,
     data: z.string(),
-    binary: z.boolean(),
+    meta: BrowserFrameMeta,
   }),
-  /** Sent for both clean closes and failed preview.ws.open attempts. */
+  /** The tab navigated (link click, pushState, redirect) — update the address. */
   z.object({
-    type: z.literal("preview.ws.closed"),
-    socketId: previewId,
-    code: z.number().int(),
+    type: z.literal("browser.navigated"),
+    sessionId: browserId,
+    url: z.string(),
+    title: z.string(),
+    /** Whether the tab's history allows going back/forward (for the chrome). */
+    canGoBack: z.boolean(),
+    canGoForward: z.boolean(),
+  }),
+  /** Reply to browser.eval. `ok` false carries the thrown error in `error`. */
+  z.object({
+    type: z.literal("browser.eval.result"),
+    sessionId: browserId,
+    requestId: browserReqId,
+    ok: z.boolean(),
+    /** JSON-encoded result value when ok; absent otherwise. */
+    value: z.string().optional(),
+    error: z.string().optional(),
+  }),
+  /** Reply to browser.dom: the tab's serialized document. */
+  z.object({
+    type: z.literal("browser.dom"),
+    sessionId: browserId,
+    requestId: browserReqId,
+    html: z.string(),
+  }),
+  /** The tab closed (requested, crashed, or failed to open). */
+  z.object({
+    type: z.literal("browser.closed"),
+    sessionId: browserId,
+    message: z.string().optional(),
   }),
   z.object({ type: z.literal("error"), message: z.string() }),
 ]);

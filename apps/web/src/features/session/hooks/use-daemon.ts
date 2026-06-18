@@ -24,9 +24,9 @@ import {
   saveRemoteLink,
 } from "@/config";
 import {
-  createPreviewBridge,
-  type PreviewBridge,
-} from "@/features/preview/bridge";
+  createBrowserClient,
+  type BrowserClient,
+} from "@/features/preview/browser-client";
 import { acquirePushToken } from "@/features/notifications/register";
 import {
   connectDirect,
@@ -122,8 +122,6 @@ export function useDaemon() {
     [terminals],
   );
   const [terminalAgents, setTerminalAgents] = useState<TerminalAgent[]>([]);
-  // Hosts the preview proxy may fetch beyond loopback (settings).
-  const [previewAllowedHosts, setPreviewAllowedHosts] = useState<string[]>([]);
   // Whether an unwatched agent bell pushes a notification (settings).
   const [notifyOnBell, setNotifyOnBell] = useState(true);
   const [workspaces, setWorkspaces] = useState<WorkspaceMeta[]>([]);
@@ -169,17 +167,16 @@ export function useDaemon() {
     [post],
   );
 
-  // Web preview plumbing: relays the service worker's intercepted HTTP and
-  // the preview iframes' WebSockets through this connection (preview.*).
-  const previewRef = useRef<PreviewBridge | null>(null);
+  // Web preview: drives headless-browser tabs on the daemon (browser.*) and
+  // decodes their streamed frames. The panel opens tabs through this client.
+  const browserRef = useRef<BrowserClient | null>(null);
+  if (!browserRef.current) browserRef.current = createBrowserClient(post);
   useEffect(() => {
-    const bridge = createPreviewBridge(post);
-    previewRef.current = bridge;
+    const client = browserRef.current;
     return () => {
-      previewRef.current = null;
-      bridge.dispose();
+      client?.dispose();
     };
-  }, [post]);
+  }, []);
 
   useEffect(() => {
     if (fragmentTicketError) setPairingError(fragmentTicketError);
@@ -290,11 +287,7 @@ export function useDaemon() {
           break;
         case "settings":
           setTerminalAgents(msg.terminalAgents);
-          setPreviewAllowedHosts(msg.previewAllowedHosts);
           setNotifyOnBell(msg.notifyOnBell);
-          // The service worker needs the allowlist to route cross-origin
-          // preview requests — keep the bridge's copy current.
-          previewRef.current?.setAllowedHosts(msg.previewAllowedHosts);
           break;
         case "terminal.data":
           terminalsRef.current.get(msg.terminalId)?.onData(msg.data);
@@ -316,14 +309,13 @@ export function useDaemon() {
           events?.onError(msg.message);
           break;
         }
-        case "preview.head":
-        case "preview.body":
-        case "preview.end":
-        case "preview.error":
-        case "preview.ws.opened":
-        case "preview.ws.message":
-        case "preview.ws.closed":
-          previewRef.current?.handleServerMessage(msg);
+        case "browser.opened":
+        case "browser.frame":
+        case "browser.navigated":
+        case "browser.eval.result":
+        case "browser.dom":
+        case "browser.closed":
+          browserRef.current?.handleServerMessage(msg);
           break;
         case "error":
           setLastError(msg.message);
@@ -349,7 +341,7 @@ export function useDaemon() {
             events.onError("connection lost");
           }
           pendingTerminalsRef.current = [];
-          previewRef.current?.connectionLost();
+          browserRef.current?.connectionLost();
           if (disposed) return;
           setStatus("disconnected");
           if (authFailed) return;
@@ -499,19 +491,11 @@ export function useDaemon() {
     [post],
   );
 
-  /** Origin-mode previews: hand a companion iframe's MessagePort to the bridge. */
-  const attachPreviewCompanion = useCallback(
-    (port: MessagePort): (() => void) =>
-      previewRef.current?.attachCompanion(port) ?? (() => {}),
-    [],
-  );
-
   const saveSettings = useCallback(
-    (agents: TerminalAgent[], allowedHosts: string[], notifyOnBell: boolean) => {
+    (agents: TerminalAgent[], notifyOnBell: boolean) => {
       post({
         type: "settings.update",
         terminalAgents: agents,
-        previewAllowedHosts: allowedHosts,
         notifyOnBell,
       });
     },
@@ -524,9 +508,8 @@ export function useDaemon() {
     attentionIds,
     clearAttention,
     terminalAgents,
-    previewAllowedHosts,
     notifyOnBell,
-    attachPreviewCompanion,
+    browser: browserRef.current as BrowserClient,
     saveSettings,
     workspaces,
     lastError,

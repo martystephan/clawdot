@@ -1,4 +1,4 @@
-import { Bell, Globe, Plus, Settings, Terminal, X, type LucideIcon } from "lucide-react";
+import { Bell, Plus, Settings, Terminal, X, type LucideIcon } from "lucide-react";
 import { useState } from "react";
 import type { TerminalAgent } from "@clawdot/protocol";
 import {
@@ -9,11 +9,10 @@ import {
   TextInput,
 } from "@/components/ui";
 
-type Category = "agents" | "preview" | "notifications";
+type Category = "agents" | "notifications";
 
 const categories: { id: Category; label: string; icon: LucideIcon }[] = [
   { id: "agents", label: "Terminal agents", icon: Terminal },
-  { id: "preview", label: "Preview", icon: Globe },
   { id: "notifications", label: "Notifications", icon: Bell },
 ];
 
@@ -27,28 +26,20 @@ const categories: { id: Category; label: string; icon: LucideIcon }[] = [
  */
 export function SettingsDialog({
   agents,
-  allowedHosts,
   notifyOnBell,
   onSave,
   onClose,
 }: {
   agents: TerminalAgent[];
-  /** Hosts the preview proxy may fetch beyond loopback. */
-  allowedHosts: string[];
   /** Push a notification when an unwatched agent rings the bell. */
   notifyOnBell: boolean;
-  onSave: (
-    agents: TerminalAgent[],
-    allowedHosts: string[],
-    notifyOnBell: boolean,
-  ) => void;
+  onSave: (agents: TerminalAgent[], notifyOnBell: boolean) => void;
   onClose: () => void;
 }) {
   const [category, setCategory] = useState<Category>("agents");
   const [draft, setDraft] = useState<TerminalAgent[]>(() =>
     agents.map((a) => ({ ...a })),
   );
-  const [hostDraft, setHostDraft] = useState<string[]>(() => [...allowedHosts]);
   const [notifyDraft, setNotifyDraft] = useState(notifyOnBell);
 
   const edit = (index: number, patch: Partial<TerminalAgent>) => {
@@ -65,11 +56,7 @@ export function SettingsDialog({
     const cleaned = draft
       .map((a) => ({ name: a.name.trim(), command: a.command.trim() }))
       .filter((a) => a.name && a.command);
-    onSave(
-      cleaned,
-      hostDraft.map((h) => h.trim().toLowerCase()).filter(Boolean),
-      notifyDraft,
-    );
+    onSave(cleaned, notifyDraft);
     onClose();
   };
 
@@ -106,11 +93,6 @@ export function SettingsDialog({
               add={() =>
                 setDraft((rows) => [...rows, { name: "", command: "" }])
               }
-            />
-          ) : category === "preview" ? (
-            <PreviewPane
-              hostDraft={hostDraft}
-              setHostDraft={setHostDraft}
             />
           ) : (
             <NotificationsPane
@@ -188,59 +170,6 @@ function AgentsPane({
       <Button className="self-start" onClick={add}>
         <Plus size={12} />
         Add agent
-      </Button>
-    </>
-  );
-}
-
-function PreviewPane({
-  hostDraft,
-  setHostDraft,
-}: {
-  hostDraft: string[];
-  setHostDraft: React.Dispatch<React.SetStateAction<string[]>>;
-}) {
-  return (
-    <>
-      <div>
-        <div className="font-[550]">Allowed hosts</div>
-        <p className="mt-0.5 text-fg-mid">
-          Hosts a previewed app may call through your machine — useful for APIs
-          that only accept localhost (CORS) or live on your private network.
-          localhost ports are always allowed; anything not listed here goes
-          straight from this device's browser.
-        </p>
-      </div>
-      {hostDraft.map((host, i) => (
-        <div key={i} className="flex items-center gap-2">
-          <TextInput
-            value={host}
-            placeholder="Host (e.g. api.example.com)"
-            aria-label="Allowed host"
-            onChange={(e) =>
-              setHostDraft((rows) =>
-                rows.map((row, j) => (j === i ? e.target.value : row)),
-              )
-            }
-          />
-          <Button
-            size="icon"
-            title="Remove host"
-            aria-label="Remove host"
-            onClick={() =>
-              setHostDraft((rows) => rows.filter((_, j) => j !== i))
-            }
-          >
-            <X size={12} />
-          </Button>
-        </div>
-      ))}
-      <Button
-        className="self-start"
-        onClick={() => setHostDraft((rows) => [...rows, ""])}
-      >
-        <Plus size={12} />
-        Add host
       </Button>
     </>
   );

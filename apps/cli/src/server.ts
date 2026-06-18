@@ -11,9 +11,8 @@ import {
 // Match the relay link's heartbeat so zombie connections from crashed browser
 // tabs are cleaned up after sleep instead of lingering until the next write.
 const LOCAL_HEARTBEAT_INTERVAL_MS = 30_000;
-import { CookieJar } from "./cookies.js";
+import { BrowserManager, BrowserSession } from "./browser.js";
 import { PushNotifier } from "./notifications.js";
-import { PreviewProxy } from "./preview.js";
 import { ConfigStore, WorkspaceStore } from "./store.js";
 import {
   openTerminal,
@@ -92,23 +91,8 @@ interface ConnectionContext {
   /** Persistent terminal sessions (daemon-scoped, survive disconnects). */
   registry: TerminalRegistry;
   config: ConfigStore;
-  /**
-   * Daemon-wide (not per-connection): previewed apps' sessions must survive
-   * the constant reconnects of a phone, or every screen lock logs the user
-   * out of the app they're previewing.
-   */
-  previewCookies: CookieJar;
-}
-
-/** The stored preview allowlist, normalized for case-insensitive matching. */
-function previewAllowedHosts(config: ConfigStore): string[] {
-  return [
-    ...new Set(
-      (config.get().previewAllowedHosts ?? [])
-        .map((host) => host.trim().toLowerCase())
-        .filter(Boolean),
-    ),
-  ];
+  /** The shared headless browser backing the web preview (lazily launched). */
+  browser: BrowserManager;
 }
 
 function settingsMessage(config: ConfigStore): ServerMessage {
@@ -116,7 +100,6 @@ function settingsMessage(config: ConfigStore): ServerMessage {
   return {
     type: "settings",
     terminalAgents: cfg.terminalAgents ?? DEFAULT_TERMINAL_AGENTS,
-    previewAllowedHosts: previewAllowedHosts(config),
     notifyOnBell: cfg.notifyOnBell ?? true,
   };
 }
@@ -167,14 +150,9 @@ function createConnection(
 
   const send = (msg: ServerMessage) => rawSend(encodeServer(msg));
 
-  // HTTP/WebSocket forwarding for the web preview; in-flight work is owned
-  // by this connection and dies with it. The allowlist is read live so a
-  // settings change applies to connections that already exist.
-  const preview = new PreviewProxy(
-    send,
-    () => previewAllowedHosts(ctx.config),
-    ctx.previewCookies,
-  );
+  // Remote-browser tabs this connection opened — one streamed Chromium tab per
+  // session. Owned by this connection and closed with it.
+  const browsers = new Map<string, BrowserSession>();
 
   const handleMessage = async (data: string): Promise<void> => {
     const msg = decodeClient(data);
@@ -400,24 +378,51 @@ function createConnection(
         }
         break;
       }
-      case "preview.fetch": {
-        preview.fetch(msg);
+      case "browser.open": {
+        // A re-open with the same id replaces the old tab (the panel reset).
+        browsers.get(msg.sessionId)?.close();
+        const session = new BrowserSession(ctx.browser, msg.sessionId, send);
+        browsers.set(msg.sessionId, session);
+        void session.open({
+          port: msg.port,
+          url: msg.url,
+          width: msg.width,
+          height: msg.height,
+          dpr: msg.dpr,
+        });
         break;
       }
-      case "preview.abort": {
-        preview.abort(msg.requestId);
+      case "browser.navigate": {
+        browsers.get(msg.sessionId)?.navigate(msg.url);
         break;
       }
-      case "preview.ws.open": {
-        preview.wsOpen(msg);
+      case "browser.action": {
+        browsers.get(msg.sessionId)?.action(msg.action);
         break;
       }
-      case "preview.ws.send": {
-        preview.wsSend(msg.socketId, msg.data, msg.binary);
+      case "browser.input": {
+        browsers.get(msg.sessionId)?.input(msg.event);
         break;
       }
-      case "preview.ws.close": {
-        preview.wsClose(msg.socketId, msg.code);
+      case "browser.resize": {
+        void browsers.get(msg.sessionId)?.resize(msg.width, msg.height, msg.dpr);
+        break;
+      }
+      case "browser.setActive": {
+        browsers.get(msg.sessionId)?.setActive(msg.active);
+        break;
+      }
+      case "browser.eval": {
+        void browsers.get(msg.sessionId)?.evaluate(msg.requestId, msg.expression);
+        break;
+      }
+      case "browser.dom": {
+        void browsers.get(msg.sessionId)?.dom(msg.requestId);
+        break;
+      }
+      case "browser.close": {
+        browsers.get(msg.sessionId)?.close();
+        browsers.delete(msg.sessionId);
         break;
       }
       case "settings.get": {
@@ -427,13 +432,6 @@ function createConnection(
       case "settings.update": {
         ctx.config.update({
           terminalAgents: msg.terminalAgents,
-          ...(msg.previewAllowedHosts !== undefined
-            ? {
-                previewAllowedHosts: msg.previewAllowedHosts
-                  .map((host) => host.trim().toLowerCase())
-                  .filter(Boolean),
-              }
-            : {}),
           ...(msg.notifyOnBell !== undefined ? { notifyOnBell: msg.notifyOnBell } : {}),
         });
         ctx.clients.broadcast(settingsMessage(ctx.config));
@@ -498,7 +496,8 @@ function createConnection(
     handleMessage: (data) => void handleMessage(data),
     handleClose: () => {
       removeClient();
-      preview.dispose();
+      for (const session of browsers.values()) session.close();
+      browsers.clear();
       // A vanished client isn't foreground — let it receive pushes again.
       if (opts.deviceKey) ctx.tunnel?.setForeground(opts.deviceKey, false);
       for (const detach of attached.values()) detach();
@@ -544,8 +543,19 @@ export function startServer(opts: {
     tunnel,
     registry,
     config,
-    previewCookies: new CookieJar(),
+    browser: new BrowserManager(opts.dataDir),
   };
+
+  // Close the headless browser (and its Chrome child) before exiting, so a
+  // service stop/restart doesn't orphan a Chromium process.
+  let shuttingDown = false;
+  const shutdown = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    void ctx.browser.dispose().finally(() => process.exit(0));
+  };
+  process.once("SIGTERM", shutdown);
+  process.once("SIGINT", shutdown);
 
   // An unwatched agent ringing the bell becomes a push to every registered
   // device — but only with a relay (the push rides its socket) and only while

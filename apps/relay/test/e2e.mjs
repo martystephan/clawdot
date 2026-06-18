@@ -262,13 +262,13 @@ check(
 );
 const health = await fetch(base + "/healthz");
 check("static: /healthz still answers", (await health.text()) === "ok");
-// Origin-mode previews live on p<port>.<host> wildcard subdomains pointed at
-// this same relay — static serving must stay host-agnostic.
+// Static serving must stay host-agnostic — the SPA answers on any subdomain
+// the user points at this relay, not just the canonical host.
 const subdomain = await fetch(base + "/", {
-  headers: { host: "p5173.clawdot.example.com" },
+  headers: { host: "app.clawdot.example.com" },
 });
 check(
-  "static: any Host header serves the app (wildcard preview subdomains)",
+  "static: any Host header serves the app",
   subdomain.status === 200 && (await subdomain.text()).includes("clawdot"),
 );
 staticRelay.kill();

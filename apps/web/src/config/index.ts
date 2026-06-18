@@ -25,6 +25,15 @@ export function daemonUrl(): string | null {
   return `ws://${location.hostname}:8787`;
 }
 
+/**
+ * True only inside the Tauri native shell (the mobile app), where the page is
+ * served from the app bundle rather than a browser tab. Features that only make
+ * sense in a real browser (e.g. the Fullscreen API) gate on this.
+ */
+export function isNativeShell(): boolean {
+  return "__TAURI_INTERNALS__" in window;
+}
+
 const REMOTE_KEY = "clawdot.remote";
 
 /**

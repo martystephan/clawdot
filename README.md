@@ -35,7 +35,7 @@ A lightweight CLI daemon runs on your computer (or home server) and hosts **term
 
 This is what makes Clawdot different. The agent doesn't just write code — it builds the interface you need to verify it:
 
-- **Building a web app?** The daemon tunnels the dev server and the app renders a live preview right inside the IDE — with a real mobile viewport on your phone.
+- **Building a web app?** The daemon runs a real headless browser on its own machine, opens your dev server in it, and streams the live tab into the IDE — so the previewed site sees the daemon's host (its IP, cookies, origin), never your phone, and there's no CORS or proxy glue to fight. You can even reach into the live DOM from the app.
 - **Building a backend?** Instead of a useless browser tab, the agent assembles an interactive test panel from declarative building blocks: forms, buttons, and response viewers wired directly to the endpoints it just created. A purpose-built mini API client, generated on the fly.
 
 Interactions flow back into the loop: press a test button, the request fails, the error lands in the agent's context, the agent fixes it. That's the feedback cycle mobile coding has been missing.
@@ -53,13 +53,13 @@ packages/
   protocol/   → shared message schemas (Zod), E2E tunnel crypto, protocol versioning
 ```
 
-**Message flow:** The protocol separates `terminal.*` messages (PTY lifecycle, keystrokes, raw output) from `surface.*` events (things the client should render — web previews, test panels). Adding a new widget type never requires touching the transport layer.
+**Message flow:** The protocol separates `terminal.*` messages (PTY lifecycle, keystrokes, raw output) and `browser.*` messages (the remote-browser screencast + input) from `surface.*` events (higher-level things the client renders — test panels). Adding a new widget type never requires touching the transport layer.
 
 **Terminal sessions are daemon-scoped.** Locking your phone drops the socket — and on mobile, it will constantly — so the agent process lives on the daemon, not the connection. The daemon feeds every PTY through a headless terminal; when you reattach (same phone or a different device), you get a serialized snapshot of the current screen plus scrollback and the live stream continues, with the agent never noticing you were gone.
 
 **Remote access is end-to-end encrypted.** The daemon dials out to the relay (no port forwarding), each phone is a multiplexed channel on that socket, and every channel runs an X25519 handshake + ChaCha20-Poly1305 framing the relay cannot open. `clawdot pair` prints a QR code; scanning it opens the hosted web app with a one-time ticket in the URL fragment, and from then on the device's own key is the credential. The relay (plus the hosted web app) deploys as one container from the root `Dockerfile` — route your domain to container port 9700 and let the fronting proxy do TLS.
 
-**Previews get their own origin (recommended setup: one extra DNS record).** Add `preview.clawdot.example.com` next to `clawdot.example.com` — an ordinary A record to the same server and an ordinary HTTPS domain entry in your proxy (a normal Let's Encrypt certificate works; no wildcard cert, no DNS-provider API). Previews then render at `https://preview.clawdot.example.com/`, where the previewed app sees its real URL paths — client-side routers, `pushState` navigation and SSR hydration all work unmodified — and gets browser storage separate from the IDE. (Wildcard alternative: `*.clawdot.example.com` serves each port at `p5173.…` with per-port storage isolation, but Let's Encrypt only issues wildcard certificates via DNS-API challenges — only worth it if you already have that.) Without any preview record, everything still works in compatibility mode (`/preview/<port>/` on the app origin), which path-sensitive apps may dislike. Either way the daemon keeps previewed apps' login sessions in an in-memory cookie jar (the tunnel can't deliver cookies to the phone's browser), so cookie-auth apps stay signed in across reconnects — nothing is ever written to disk.
+**The web preview is a remote browser, not a proxy.** The daemon drives a real headless Chromium on its own machine (via the Chrome DevTools Protocol), one tab per preview, and screencasts it into the app as JPEG frames over the same E2E-encrypted connection; your pointer and keyboard are forwarded back. Because the page actually executes on the daemon's host, the previewed site sees the daemon — its IP, DNS, cookies and real origin — so client-side routers, `pushState`, SSR hydration, cookie sessions and same-origin API calls all just work, with no service worker, no CORS escape hatch, and no DNS records or certificates to set up. The app can also evaluate JavaScript against the live DOM (the in-app console) — useful for assertions and, later, generative test surfaces. The first time it's needed the daemon uses a system Chrome if present, otherwise downloads a managed Chromium into the data dir once (~150 MB); set `CLAWDOT_CHROME` to point at a specific binary.
 
 ## Install
 
@@ -116,10 +116,8 @@ credentials ship in this repo.
 - [x] CLI daemon: persistent terminal sessions (PTYs) for any agent CLI, workspace tracking, relay connection + QR pairing
 - [x] Relay server: minimal ciphertext-only WebSocket forwarder (self-hostable)
 - [x] Web app: terminal session list, full-screen xterm.js views, reattach with scrollback replay
-- [x] Port proxy + embedded web preview (preview panel: HTTP + WebSocket forwarding through the E2E tunnel via a service worker)
-- [x] Multi-port apps + CORS escape hatch: cross-origin localhost calls from a preview tunnel automatically; an allowlist in settings routes chosen external hosts through your machine (sidesteps localhost-pinned CORS, reaches private-network hosts)
-- [x] Cookie sessions in previews: a daemon-side in-memory cookie jar keeps previewed apps logged in (Better Auth & co.) — the browser can't hold tunnel cookies, so the daemon does
-- [x] Own-origin previews: one `preview.` DNS record (ordinary certificate — recommended) or wildcard `p<port>.` subdomains give previews real URL paths (client routers, pushState, SSR hydration just work) and browser storage separate from the IDE; automatic fallback to `/preview/<port>/` where neither exists (Tauri shell, no DNS record)
+- [x] Remote-browser web preview: a real headless Chromium runs on the daemon and is screencast into the app over the E2E tunnel, with pointer/keyboard forwarded back — the previewed site sees the daemon's host, so routers/`pushState`/SSR/cookie sessions/same-origin APIs work with no proxy, CORS, or DNS setup
+- [x] Live DOM access from the app: evaluate JavaScript against the previewed page (in-app console) — the substrate for assertions and generative test surfaces
 - [ ] Generative test surfaces: declarative widget schema, API test panels
 - [x] Native mobile app shell (Tauri 2 wrapper around the web app; iOS project generated, Android pending an SDK install)
 - [ ] Desktop / VS Code integration
@@ -132,7 +130,7 @@ credentials ship in this repo.
 
 ## Status
 
-🚧 Early development. Working today: the daemon runs persistent terminal sessions for any agent CLI (`claude`, `codex`, a plain shell — the list is editable in the app); the web app drives them full-screen via xterm.js and reattaches with a scrollback replay after a disconnect — locally or from anywhere through the self-hosted relay with QR pairing and end-to-end encryption. The first surface is in: a web preview panel that renders a dev server running on the daemon's machine, with all HTTP and WebSocket traffic (Vite HMR included) forwarded through the same encrypted connection.
+🚧 Early development. Working today: the daemon runs persistent terminal sessions for any agent CLI (`claude`, `codex`, a plain shell — the list is editable in the app); the web app drives them full-screen via xterm.js and reattaches with a scrollback replay after a disconnect — locally or from anywhere through the self-hosted relay with QR pairing and end-to-end encryption. The first surface is in: a web preview that runs a real headless browser on the daemon's machine, opens your dev server in it, and streams the live tab into the app over the same encrypted connection (with input forwarded back and the page's DOM reachable from an in-app console).
 
 ## License
 

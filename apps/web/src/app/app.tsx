@@ -150,9 +150,8 @@ function SessionScreen() {
     attentionIds,
     clearAttention,
     terminalAgents,
-    previewAllowedHosts,
     notifyOnBell,
-    attachPreviewCompanion,
+    browser,
     saveSettings,
     workspaces,
     lastError,
@@ -233,6 +232,13 @@ function SessionScreen() {
     () => new Set(terminals.map((t) => t.terminalId)),
     [terminals],
   );
+  // Preview tabs live on past their panel's unmount (so switching sessions
+  // keeps each session's browser alive in the background) — so close the tabs
+  // of sessions that no longer exist. The active session is always retained,
+  // covering the brief window before a just-opened terminal hits the catalog.
+  useEffect(() => {
+    browser.retainViews(new Set([...liveIds, HOME_KEY, sessionKey]));
+  }, [browser, liveIds, sessionKey]);
   // Companion shells are hidden from the sidebar — they're an implementation
   // detail of the selected session, not sessions in their own right.
   const companionIds = useMemo(
@@ -511,9 +517,8 @@ function SessionScreen() {
         {openPanel === "preview" && (
           <PreviewPanel
             key={sessionKey}
-            connected
             storageKey={sessionKey}
-            attachCompanion={attachPreviewCompanion}
+            browser={browser}
             onClose={() => togglePanel("preview")}
           />
         )}
@@ -533,7 +538,6 @@ function SessionScreen() {
       {settingsOpen && (
         <SettingsDialog
           agents={terminalAgents}
-          allowedHosts={previewAllowedHosts}
           notifyOnBell={notifyOnBell}
           onSave={saveSettings}
           onClose={() => setSettingsOpen(false)}
