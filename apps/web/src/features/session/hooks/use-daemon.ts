@@ -345,6 +345,20 @@ export function useDaemon() {
           if (disposed) return;
           setStatus("disconnected");
           if (authFailed) return;
+          // A pairing whose socket closed before the handshake established
+          // never reached onAuthFailure (the relay dropped us — typically the
+          // daemon wasn't in the room to answer the hello, so the 8s timeout
+          // was cleared by this very close). Surface it instead of retrying
+          // forever in silence — that's the "camera vanished, nothing
+          // happened" report. Scanning again re-arms a fresh attempt.
+          if (pendingPairingRef.current) {
+            pendingPairingRef.current = null;
+            setStatus("unpaired");
+            setPairingError(
+              "couldn't reach the daemon to finish pairing — make sure it's running and connected to the relay, then scan again",
+            );
+            return;
+          }
           reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
         },
         onAuthFailure: (reason: string) => {
