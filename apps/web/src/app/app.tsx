@@ -1,4 +1,4 @@
-import { Globe, Menu, Terminal } from "lucide-react";
+import { Globe, Menu } from "lucide-react";
 import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import type { TerminalAgent } from "@clawdot/protocol";
 import logoUrl from "../../../../assets/icon.svg";
@@ -9,11 +9,6 @@ import { SessionSidebar } from "@/features/session/components/session-sidebar";
 import { SettingsDialog } from "@/features/session/components/settings-dialog";
 
 // Lazy: xterm.js is heavy and many visits never open a terminal.
-const TerminalPanel = lazy(() =>
-  import("@/features/session/components/terminal-panel").then((m) => ({
-    default: m.TerminalPanel,
-  })),
-);
 const TerminalSessionView = lazy(() =>
   import("@/features/session/components/terminal-session-view").then((m) => ({
     default: m.TerminalSessionView,
@@ -25,29 +20,13 @@ import { useDaemon } from "@/features/session/hooks/use-daemon";
 import type { ConnectionStatus } from "@/features/session/types";
 
 const THEME_KEY = "clawdot.theme";
-// Which session each background companion shell belongs to (sessionId →
-// companion terminalId). Persisted so a reload keeps the shells hidden from
-// the sidebar and reattaches instead of orphaning them.
-const COMPANIONS_KEY = "clawdot.companions";
-// Bucket for the right panels when no agent session is selected (home view).
+// Bucket for the right panel when no agent session is selected (home view).
 const HOME_KEY = "__home__";
 
 function basename(path: string): string {
   return path.split("/").filter(Boolean).at(-1) ?? path;
 }
 const NARROW_QUERY = "(max-width: 700px)";
-
-/** The right panel bound to a session — at most one (they share the edge). */
-type SidePanel = "terminal" | "preview";
-
-function loadCompanions(): Record<string, string> {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(COMPANIONS_KEY) ?? "{}");
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
-  }
-}
 
 function useTheme() {
   const [dark, setDark] = useState(
@@ -195,19 +174,11 @@ function SessionScreen() {
   } | null>(null);
   // Selected terminal session — takes over the main view.
   const [activeTermId, setActiveTermId] = useState<string | null>(null);
-  // The right panel (terminal/preview) open for each session — switching
-  // sessions swaps it automatically since it's keyed by the session.
-  const [panelBySession, setPanelBySession] = useState<
-    Record<string, SidePanel | null>
+  // Whether the preview panel is open for each session — switching sessions
+  // swaps it automatically since it's keyed by the session.
+  const [previewBySession, setPreviewBySession] = useState<
+    Record<string, boolean>
   >({});
-  // Each session's hidden background shell; persisted across reloads.
-  const [companions, setCompanions] =
-    useState<Record<string, string>>(loadCompanions);
-  useEffect(() => {
-    localStorage.setItem(COMPANIONS_KEY, JSON.stringify(companions));
-  }, [companions]);
-  // Sessions whose companion shell is mid-spawn (the open reply is in flight).
-  const [spawning, setSpawning] = useState<Set<string>>(() => new Set());
   const [settingsOpen, setSettingsOpen] = useState(false);
   // Pairing failures should be visible even if the user never opened the
   // dialog (e.g. a scanned QR with a stale ticket).
@@ -222,11 +193,11 @@ function SessionScreen() {
   const activeTerm = terminals.find((t) => t.terminalId === activeTermId);
   const workspace = activeTerm?.cwd ?? null;
 
-  // The right panels are bound to the selected session (home gets its own
+  // The preview panel is bound to the selected session (home gets its own
   // bucket). Toggling flips this session's panel; switching sessions reads a
-  // different entry, so the panels follow the selection.
+  // different entry, so the panel follows the selection.
   const sessionKey = activeTermId ?? HOME_KEY;
-  const openPanel = panelBySession[sessionKey] ?? null;
+  const previewOpen = previewBySession[sessionKey] ?? false;
 
   const liveIds = useMemo(
     () => new Set(terminals.map((t) => t.terminalId)),
@@ -239,85 +210,10 @@ function SessionScreen() {
   useEffect(() => {
     browser.retainViews(new Set([...liveIds, HOME_KEY, sessionKey]));
   }, [browser, liveIds, sessionKey]);
-  // Companion shells are hidden from the sidebar — they're an implementation
-  // detail of the selected session, not sessions in their own right.
-  const companionIds = useMemo(
-    () => new Set(Object.values(companions)),
-    [companions],
-  );
-  const sidebarTerminals = useMemo(
-    () => terminals.filter((t) => !companionIds.has(t.terminalId)),
-    [terminals, companionIds],
-  );
-  // This session's background shell, but only if it's still alive — a dead id
-  // (its shell exited, or the daemon restarted) means open a fresh one.
-  const storedCompanion = companions[sessionKey];
-  const companionId =
-    storedCompanion && liveIds.has(storedCompanion) ? storedCompanion : null;
 
-  // Spawn a session's background shell (persistent open then attach happens in
-  // the panel). Done from click handlers, never an effect: a persistent open
-  // isn't idempotent and StrictMode double-invokes effects.
-  const spawnCompanion = (key: string, cwd: string | null) => {
-    setSpawning((s) => new Set(s).add(key));
-    const clearSpawning = () =>
-      setSpawning((s) => {
-        const next = new Set(s);
-        next.delete(key);
-        return next;
-      });
-    terminal.open(
-      {
-        ...(cwd ? { cwd } : {}),
-        cols: 80,
-        rows: 24,
-        persistent: true,
-        title: "Shell",
-      },
-      {
-        onOpened: (id) => {
-          setCompanions((c) => ({ ...c, [key]: id }));
-          clearSpawning();
-        },
-        onData: () => {},
-        onExit: () => {},
-        onError: clearSpawning,
-        onBusy: () => {},
-      },
-    );
+  const togglePreview = () => {
+    setPreviewBySession((s) => ({ ...s, [sessionKey]: !previewOpen }));
   };
-
-  const togglePanel = (panel: SidePanel) => {
-    const turningOn = openPanel !== panel;
-    setPanelBySession((s) => ({ ...s, [sessionKey]: turningOn ? panel : null }));
-    // Opening the terminal with no live shell yet kicks one off so the panel
-    // shows a live shell rather than a "start" prompt.
-    if (
-      panel === "terminal" &&
-      turningOn &&
-      companionId === null &&
-      !spawning.has(sessionKey)
-    ) {
-      spawnCompanion(sessionKey, workspace);
-    }
-  };
-
-  // When an agent session ends (killed, or its process exits on its own) its
-  // background shell goes with it — kill the orphan and forget the mapping so
-  // it never resurfaces in the sidebar. (A daemon restart wipes every
-  // persistent terminal at once; the close calls are then harmless no-ops.)
-  useEffect(() => {
-    const orphans = Object.entries(companions).filter(
-      ([session]) => session !== HOME_KEY && !liveIds.has(session),
-    );
-    if (orphans.length === 0) return;
-    for (const [, id] of orphans) terminal.close(id);
-    setCompanions((prev) => {
-      const next = { ...prev };
-      for (const [session] of orphans) delete next[session];
-      return next;
-    });
-  }, [liveIds, companions, terminal]);
 
   const closeSidebarIfNarrow = () => {
     if (window.matchMedia(NARROW_QUERY).matches) setSidebarOpen(false);
@@ -394,7 +290,7 @@ function SessionScreen() {
             .mobile-takeover in styles.css) and close via their own buttons. */}
         {sidebarOpen && (
           <SessionSidebar
-            terminals={sidebarTerminals}
+            terminals={terminals}
             terminalAgents={terminalAgents}
             workspaces={workspaces}
             activeTerminalId={activeTermId}
@@ -411,12 +307,8 @@ function SessionScreen() {
             onRemoveWorkspace={removeWorkspace}
             // Killing the selected terminal deselects it right away — the
             // user asked for it to die, no "process exited" overlay needed.
-            // Its background companion shell dies with it.
             onKillTerminal={(id) => {
-              const companion = companions[id];
-              if (companion) terminal.close(companion);
               terminal.close(id);
-              setCompanions(({ [id]: _gone, ...rest }) => rest);
               if (id === activeTermId) setActiveTermId(null);
             }}
             remotePaired={remote !== null}
@@ -457,24 +349,9 @@ function SessionScreen() {
               size="icon"
               title="Toggle web preview"
               aria-label="Toggle web preview"
-              // One right panel at a time — they'd fight for the same edge.
-              onClick={() => togglePanel("preview")}
+              onClick={togglePreview}
             >
-              <Globe
-                size={15}
-                className={openPanel === "preview" ? "text-fg" : undefined}
-              />
-            </Button>
-            <Button
-              size="icon"
-              title="Toggle terminal"
-              aria-label="Toggle terminal"
-              onClick={() => togglePanel("terminal")}
-            >
-              <Terminal
-                size={15}
-                className={openPanel === "terminal" ? "text-fg" : undefined}
-              />
+              <Globe size={15} className={previewOpen ? "text-fg" : undefined} />
             </Button>
           </header>
 
@@ -500,26 +377,13 @@ function SessionScreen() {
         </section>
 
         {/* Keyed by session so switching remounts onto that session's
-            companion shell / preview port. */}
-        {openPanel === "terminal" && (
-          <Suspense fallback={null}>
-            <TerminalPanel
-              connected
-              companionId={companionId}
-              spawning={spawning.has(sessionKey)}
-              terminal={terminal}
-              onStart={() => spawnCompanion(sessionKey, workspace)}
-              onClose={() => togglePanel("terminal")}
-            />
-          </Suspense>
-        )}
-
-        {openPanel === "preview" && (
+            preview port. */}
+        {previewOpen && (
           <PreviewPanel
             key={sessionKey}
             storageKey={sessionKey}
             browser={browser}
-            onClose={() => togglePanel("preview")}
+            onClose={togglePreview}
           />
         )}
       </div>
