@@ -6,6 +6,8 @@ import {
   ExternalLink,
   Frame,
   Globe,
+  Hand,
+  Keyboard,
   Maximize,
   Maximize2,
   Minimize,
@@ -51,6 +53,15 @@ function modifiers(e: {
 const MOUSE_BUTTON = ["left", "middle", "right"] as const;
 /** A touch drag shorter than this counts as a tap (a click), not a scroll. */
 const TAP_SLOP_PX = 6;
+
+/** Does the remote page currently have a text-editable element focused? Used
+ *  after a tap to decide whether to raise the soft keyboard. */
+const IS_EDITABLE_EXPR = `(() => {
+  const el = document.activeElement;
+  if (!el) return false;
+  const tag = el.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable === true;
+})()`;
 
 /** Height of the floating window's titlebar (the drag handle) in canvas mode. */
 const TITLEBAR_H = 26;
@@ -145,6 +156,10 @@ export function PreviewPanel({
   const [winSize, setWinSize] = useState({ width: 390, height: 844 });
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [zoom, setZoom] = useState(1);
+  // Navigate (input-lock) mode: stop forwarding pointer/keyboard to the remote
+  // page so a one-finger drag pans the stage and pinch/wheel zooms instead —
+  // makes arranging the window on a touchscreen far easier. Canvas mode only.
+  const [locked, setLocked] = useState(false);
 
   // Maximize: expand the side panel to cover the whole app viewport (a CSS
   // overlay, not the OS Fullscreen API). Pointless inside the native mobile
@@ -152,8 +167,23 @@ export function PreviewPanel({
   const canMaximize = !isNativeShell();
   const [maximized, setMaximized] = useState(false);
 
+  // Fit-mode aspect tracking. The daemon drives the emulated viewport to match
+  // the panel, but the first frames after open (or after the panel resizes —
+  // e.g. a mobile keyboard dismissing) arrive at the OLD aspect. Rather than
+  // stretch the bitmap to fill the panel (visibly distorted), we size the
+  // canvas to the frame's real aspect and centre it, so a transient mismatch
+  // letterboxes instead of warping. Input stays exact: toViewport measures the
+  // canvas's own rect, which now matches the drawn image.
+  const [containerSize, setContainerSize] = useState({ width: 0, height: 0 });
+  const [frameAspect, setFrameAspect] = useState(0);
+
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  // Off-screen editable element whose focus raises the mobile OS keyboard (see
+  // the soft-keyboard bridge below). `keyboardOpen` tracks whether it's focused.
+  const keyboardRef = useRef<HTMLTextAreaElement | null>(null);
+  const composingRef = useRef(false);
+  const [keyboardOpen, setKeyboardOpen] = useState(false);
   // The emulated viewport (CSS px) — used to map input back to page coords.
   const viewportRef = useRef({ width: 1, height: 1 });
   const touchRef = useRef<{
@@ -196,6 +226,8 @@ export function PreviewPanel({
           width: frame.meta.deviceWidth || viewportRef.current.width,
           height: frame.meta.deviceHeight || viewportRef.current.height,
         };
+        if (frame.meta.deviceWidth && frame.meta.deviceHeight)
+          setFrameAspect(frame.meta.deviceWidth / frame.meta.deviceHeight);
         drawFrame(frame.data);
       },
       onState: (state) => {
@@ -228,11 +260,15 @@ export function PreviewPanel({
     }
     const el = containerRef.current;
     if (!el) return;
+    // Seed the panel size now so fit sizing has a box before the first resize.
+    const seed = measure();
+    setContainerSize({ width: seed.width, height: seed.height });
     let timer: ReturnType<typeof setTimeout>;
     const ro = new ResizeObserver(() => {
       clearTimeout(timer);
       timer = setTimeout(() => {
         const { width, height, dpr } = measure();
+        setContainerSize({ width, height });
         viewportRef.current = { width, height };
         view.resize(width, height, dpr);
       }, 150);
@@ -243,6 +279,30 @@ export function PreviewPanel({
       ro.disconnect();
     };
   }, [view, mode, winSize]);
+
+  // Fit-mode display box: the largest rect of the frame's aspect ratio that
+  // fits inside the panel (object-contain, but sizing the element itself so
+  // input mapping stays exact). Null until we know both sizes — fall back to
+  // filling the panel for that first paint.
+  const fitCanvas = useMemo(() => {
+    if (
+      mode !== "fit" ||
+      !frameAspect ||
+      !containerSize.width ||
+      !containerSize.height
+    )
+      return null;
+    const panelAspect = containerSize.width / containerSize.height;
+    if (frameAspect > panelAspect)
+      return {
+        width: containerSize.width,
+        height: Math.round(containerSize.width / frameAspect),
+      };
+    return {
+      width: Math.round(containerSize.height * frameAspect),
+      height: containerSize.height,
+    };
+  }, [mode, frameAspect, containerSize]);
 
   // Address-bar submit: navigate the open tab, or open one if none yet.
   const go = (e: React.FormEvent) => {
@@ -282,10 +342,13 @@ export function PreviewPanel({
   const send = (event: BrowserInput) => view.input(event);
 
   const onPointerDown = (e: React.PointerEvent) => {
-    canvasRef.current?.focus();
     const { x, y } = toViewport(e.clientX, e.clientY);
     e.currentTarget.setPointerCapture(e.pointerId);
     if (e.pointerType === "mouse") {
+      // Focus the sink so a hardware keyboard reaches the page (no soft keyboard
+      // is raised without touch). Touch defers — a stray focus would pop the OS
+      // keyboard on every tap; onPointerUp raises it only on editable taps.
+      openKeyboard();
       send({
         kind: "mouse",
         type: "mousePressed",
@@ -373,6 +436,15 @@ export function PreviewPanel({
         button: "left",
         clickCount: 1,
       });
+      // Raise or dismiss the soft keyboard based on whether the tap focused an
+      // editable element in the remote page. The eval round-trip leaves the
+      // user gesture, so the focus() lands within gesture only on lenient
+      // engines (Android); on iOS the keyboard toolbar button is the reliable
+      // path. Dismissing (blur) works regardless of gesture.
+      view
+        .eval(IS_EDITABLE_EXPR)
+        .then((editable) => (editable ? openKeyboard() : closeKeyboard()))
+        .catch(() => {});
     }
   };
 
@@ -395,36 +467,67 @@ export function PreviewPanel({
     if (text) send({ kind: "text", text });
   };
 
-  const onPaste = (e: React.ClipboardEvent) => {
-    e.preventDefault();
-    sendText(e.clipboardData.getData("text"));
-  };
-
   // Toolbar fallback (mobile has no Cmd/Ctrl+V): read the device clipboard and
   // insert it. Needs a user gesture + clipboard-read permission; ignore denial.
   const pasteFromClipboard = async () => {
     try {
       const text = await navigator.clipboard.readText();
-      canvasRef.current?.focus();
       sendText(text);
     } catch {
       // Clipboard read blocked (permission/insecure context) — nothing to do.
     }
   };
 
+  // --- Soft-keyboard bridge -------------------------------------------------
+  // A streamed <canvas> is not an editable element, so tapping a text field in
+  // the remote page never raises the device's on-screen keyboard, and iOS soft
+  // keyboards don't emit usable keydown events for printable characters (they
+  // report keyCode 229). Keyboard input is therefore routed through an
+  // off-screen <textarea> "sink": focusing it summons the OS keyboard, typed
+  // text arrives as input/composition events (forwarded verbatim via CDP
+  // insertText), and control keys (Backspace/Enter/arrows/shortcuts) still come
+  // through keydown. Focus must happen inside a user gesture or iOS ignores it —
+  // hence the toolbar button and the synchronous focus on a mouse press.
+  const openKeyboard = () => keyboardRef.current?.focus({ preventScroll: true });
+  const closeKeyboard = () => keyboardRef.current?.blur();
+
+  // Forward whatever the OS keyboard inserted, then reset the sink so the next
+  // input event starts clean (and Backspace on an empty field still keydowns).
+  const onKbInput = (e: React.FormEvent<HTMLTextAreaElement>) => {
+    if (composingRef.current) return; // mid-IME: wait for compositionend
+    const el = e.currentTarget;
+    if (el.value) {
+      sendText(el.value);
+      el.value = "";
+    }
+  };
+  const onKbCompositionEnd = (e: React.CompositionEvent<HTMLTextAreaElement>) => {
+    composingRef.current = false;
+    const el = e.currentTarget;
+    if (el.value) sendText(el.value);
+    el.value = "";
+  };
+
   const onKey = (e: React.KeyboardEvent, type: "keyDown" | "keyUp") => {
+    // iOS reports printable keys as keyCode 229 / "Unidentified" — those are
+    // delivered by the input event instead; ignore them here.
+    if (e.keyCode === 229 || e.key === "Unidentified") return;
+    // Single printable characters also ride the input event; forwarding them as
+    // keystrokes too would double-type. Only non-printable keys go through here
+    // (preventDefault stops the sink from mutating, so no stray input event).
+    const printable = e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey;
+    if (printable) return;
     // Let the native paste event handle Cmd/Ctrl+V: don't preventDefault (it can
-    // suppress the paste event) and don't also forward it as a keystroke.
+    // suppress the paste event) and don't forward it as a keystroke either; the
+    // pasted text flows through the sink's input event.
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "v") return;
     e.preventDefault();
-    const printable = e.key.length === 1 && !e.ctrlKey && !e.metaKey;
     send({
       kind: "key",
       type,
       key: e.key,
       code: e.code,
       windowsVirtualKeyCode: e.keyCode,
-      ...(type === "keyDown" && printable ? { text: e.key } : {}),
       modifiers: modifiers(e),
     });
   };
@@ -452,6 +555,7 @@ export function PreviewPanel({
   const toggleMode = () => {
     if (mode === "canvas") {
       setMode("fit");
+      setLocked(false);
       return;
     }
     // Seed the window from the current viewport so the layout doesn't jump.
@@ -601,6 +705,16 @@ export function PreviewPanel({
             </Button>
             <Button
               size="icon"
+              title={keyboardOpen ? "Hide keyboard" : "Show keyboard"}
+              aria-label="Toggle keyboard"
+              aria-pressed={keyboardOpen}
+              className={cn(keyboardOpen ? "bg-hover text-fg" : undefined)}
+              onClick={() => (keyboardOpen ? closeKeyboard() : openKeyboard())}
+            >
+              <Keyboard size={13} />
+            </Button>
+            <Button
+              size="icon"
               title="Console (evaluate JS in the page)"
               aria-label="Toggle console"
               onClick={() => setConsoleOpen((v) => !v)}
@@ -710,6 +824,28 @@ export function PreviewPanel({
           mode === "canvas" ? "bg-inset" : "bg-white",
         )}
       >
+        {/* Off-screen soft-keyboard sink (see the bridge above). Kept on-screen
+            but invisible and non-interactive: iOS won't raise the keyboard for
+            a display:none / out-of-viewport element, and pointer-events-none
+            stops it from stealing taps meant for the canvas. */}
+        <textarea
+          ref={keyboardRef}
+          onInput={onKbInput}
+          onKeyDown={(e) => onKey(e, "keyDown")}
+          onKeyUp={(e) => onKey(e, "keyUp")}
+          onCompositionStart={() => (composingRef.current = true)}
+          onCompositionEnd={onKbCompositionEnd}
+          onFocus={() => setKeyboardOpen(true)}
+          onBlur={() => setKeyboardOpen(false)}
+          aria-hidden
+          tabIndex={-1}
+          autoCapitalize="off"
+          autoCorrect="off"
+          autoComplete="off"
+          spellCheck={false}
+          className="pointer-events-none absolute left-0 top-0 z-40 size-px resize-none border-0 bg-transparent p-0 text-transparent caret-transparent opacity-0 outline-none"
+        />
+
         {/* The pannable 2D space: drag empty area to pan, wheel/pinch to zoom.
             It sits behind the (pointer-events-none) stage, which lets gestures
             on empty space reach it while the window frame stays interactive. */}
@@ -739,8 +875,14 @@ export function PreviewPanel({
             className={cn(
               mode === "canvas"
                 ? "pointer-events-auto absolute left-0 top-0 overflow-hidden rounded-lg border border-border-strong bg-white shadow-2xl"
-                : "h-full w-full",
+                : "flex h-full w-full items-center justify-center",
+              mode === "canvas" && locked && "cursor-grab active:cursor-grabbing",
             )}
+            // When locked, the page-input layer (canvas) is inert, so drags on
+            // the window pan the stage and wheel/pinch zooms — same as the
+            // empty-space backdrop, but works over the window too.
+            onPointerDown={mode === "canvas" && locked ? startPan : undefined}
+            onWheel={mode === "canvas" && locked ? onStageWheel : undefined}
             style={
               mode === "canvas"
                 ? { width: winSize.width, height: winSize.height + TITLEBAR_H }
@@ -759,19 +901,15 @@ export function PreviewPanel({
             )}
             <canvas
               ref={canvasRef}
-              tabIndex={0}
               onPointerDown={onPointerDown}
               onPointerMove={onPointerMove}
               onPointerUp={onPointerUp}
               onPointerCancel={onPointerUp}
               onWheel={onWheel}
               onContextMenu={(e) => e.preventDefault()}
-              onPaste={onPaste}
-              onKeyDown={(e) => onKey(e, "keyDown")}
-              onKeyUp={(e) => onKey(e, "keyUp")}
               className={cn(
                 "block outline-none",
-                mode === "fit" && "h-full w-full",
+                mode === "canvas" && locked && "pointer-events-none",
               )}
               style={
                 mode === "canvas"
@@ -780,7 +918,15 @@ export function PreviewPanel({
                       height: winSize.height,
                       display: active ? "block" : "none",
                     }
-                  : { display: active ? "block" : "none" }
+                  : {
+                      display: active ? "block" : "none",
+                      // Sized to the frame's aspect (centred by the flex
+                      // wrapper); falls back to filling the panel until the
+                      // first frame tells us the aspect.
+                      ...(fitCanvas
+                        ? { width: fitCanvas.width, height: fitCanvas.height }
+                        : { width: "100%", height: "100%" }),
+                    }
               }
             />
             {mode === "canvas" && (
@@ -824,6 +970,21 @@ export function PreviewPanel({
         {/* Freeform-canvas controls: device presets + zoom. */}
         {mode === "canvas" && active && (
           <div className="absolute bottom-2.5 left-1/2 z-30 flex -translate-x-1/2 items-center gap-0.5 rounded-md border border-border bg-app/95 px-1.5 py-1 shadow-lg backdrop-blur">
+            <Button
+              size="icon"
+              title={
+                locked
+                  ? "Page input locked — tap to interact with the page again"
+                  : "Navigate (lock page input — drag to pan, pinch/wheel to zoom)"
+              }
+              aria-label="Toggle navigate mode"
+              aria-pressed={locked}
+              className={cn(locked ? "bg-hover text-fg" : undefined)}
+              onClick={() => setLocked((v) => !v)}
+            >
+              <Hand size={13} />
+            </Button>
+            <span className="mx-0.5 h-4 w-px bg-border" />
             {SIZE_PRESETS.map((p) => (
               <Button
                 key={p.label}
