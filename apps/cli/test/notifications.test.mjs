@@ -4,7 +4,7 @@
 //   tsx --test test/notifications.test.mjs  (part of `pnpm --filter @clawdot/cli test`)
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { generateKeyPair, toBase64Url } from "@clawdot/protocol/tunnel";
@@ -87,6 +87,64 @@ test("TunnelService stores, lists, and prunes push tokens per device", () => {
     // clear removes it
     reloaded.clearPushToken(key);
     assert.deepEqual(reloaded.pushTargets(), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("re-registering a token claims it off other device records", () => {
+  const dir = mkdtempSync(join(tmpdir(), "clawdot-notify-"));
+  try {
+    const tunnel = new TunnelService(dir, "wss://relay.example/v1");
+    // One phone, re-paired three times: three device records, one FCM token.
+    for (let i = 0; i < 3; i++) {
+      const device = generateKeyPair();
+      tunnel.registerDevice(device.publicKey);
+      tunnel.setPushToken(toBase64Url(device.publicKey), "phone-token", "ios");
+    }
+    // Each register claims the token off the older records, so only the newest
+    // holds it and the fan-out targets the device a single time.
+    assert.deepEqual(tunnel.pushTargets(), [
+      { token: "phone-token", platform: "ios" },
+    ]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a registry already dirty with duplicate tokens rings each device once", () => {
+  const dir = mkdtempSync(join(tmpdir(), "clawdot-notify-"));
+  try {
+    // Simulate a devices.json written by an older daemon: the same phone token
+    // duplicated across three stale records, plus a second real device.
+    const dup = (token) => ({
+      addedAt: 1,
+      lastSeenAt: 1,
+      push: { token, platform: "ios", updatedAt: 1 },
+    });
+    writeFileSync(
+      join(dir, "devices.json"),
+      JSON.stringify({
+        keyA: dup("phone-token"),
+        keyB: dup("phone-token"),
+        keyC: dup("phone-token"),
+        keyD: dup("second-phone"),
+      }),
+    );
+    const tunnel = new TunnelService(dir, "wss://relay.example/v1");
+
+    // The duplicated token fans out exactly once; the distinct device too.
+    assert.deepEqual(
+      tunnel.pushTargets().map((t) => t.token).sort(),
+      ["phone-token", "second-phone"],
+    );
+
+    // Foregrounding ANY record holding the duplicated token suppresses it,
+    // even though two other (backgrounded) records still carry the same token.
+    tunnel.setForeground("keyB", true);
+    assert.deepEqual(tunnel.pushTargets(), [
+      { token: "second-phone", platform: "ios" },
+    ]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

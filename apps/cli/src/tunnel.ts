@@ -224,10 +224,19 @@ export class TunnelService {
    * Record (or refresh) a device's push token. No-op for an unknown device —
    * only a paired, trusted device can register, and the key comes straight
    * from its authenticated channel.
+   *
+   * A push token uniquely identifies one physical app install, but every
+   * pairing mints a fresh device key, so the same phone re-paired N times would
+   * leave its token under N records and get pushed N times. Enforce the
+   * invariant "a token lives under at most one device": claim it here by
+   * dropping it from every other record.
    */
   setPushToken(deviceKey: string, token: string, platform: string): void {
     const record = this.devices[deviceKey];
     if (!record) return;
+    for (const [key, other] of Object.entries(this.devices)) {
+      if (key !== deviceKey && other.push?.token === token) delete other.push;
+    }
     record.push = { token, platform, updatedAt: Date.now() };
     this.saveDevices();
   }
@@ -256,11 +265,26 @@ export class TunnelService {
    * app is currently foregrounded (they'd see the attention in-app).
    */
   pushTargets(): PushTarget[] {
-    return Object.entries(this.devices)
-      .filter(([key]) => !this.foregroundDevices.has(key))
-      .map(([, record]) => record.push)
-      .filter((push): push is NonNullable<typeof push> => !!push)
-      .map(({ token, platform }) => ({ token, platform }));
+    // A token can sit under several stale records (a phone re-paired under a
+    // fresh key each time). Treat it as one physical device: suppress it if ANY
+    // of its records is foregrounded (the user is looking at the app there), and
+    // otherwise emit it exactly once so the device rings a single time.
+    const foregroundTokens = new Set<string>();
+    for (const [key, record] of Object.entries(this.devices)) {
+      if (record.push && this.foregroundDevices.has(key)) {
+        foregroundTokens.add(record.push.token);
+      }
+    }
+    const seen = new Set<string>();
+    const targets: PushTarget[] = [];
+    for (const record of Object.values(this.devices)) {
+      if (!record.push) continue;
+      const { token, platform } = record.push;
+      if (foregroundTokens.has(token) || seen.has(token)) continue;
+      seen.add(token);
+      targets.push({ token, platform });
+    }
+    return targets;
   }
 
   /**
