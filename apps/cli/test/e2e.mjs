@@ -393,6 +393,49 @@ check("attaching a dead terminal is a scoped error", gone.message.length > 0);
 p2.close();
 sObserver.close();
 
+// --- Scenario 4b: a user-initiated kill must not flag attention ----------------
+// A dying agent often emits a bell while tearing down. With no viewer attached
+// that bell would otherwise trip the attention path (catalog needsAttention +
+// push notification). Killing on the user's behalf must stay silent.
+const bellObserver = connect();
+await bellObserver.open();
+const bellOpener = connect();
+await bellOpener.open();
+const bellOpenP = bellOpener.next(
+  (m) => m.type === "terminal.opened",
+  "bell terminal opened",
+);
+bellOpener.send({
+  type: "terminal.open",
+  cwd: otherCwd,
+  cols: 80,
+  rows: 24,
+  persistent: true,
+  title: "Bell",
+  // Ring the bell on teardown, covering node-pty's SIGHUP kill and SIGTERM.
+  command: "trap 'printf \"\\a\"; exit 0' HUP TERM; printf 'READY\\n'; cat",
+});
+const bellOpened = await bellOpenP;
+// Deliberately never attach — an unwatched bell is exactly what would notify.
+const bellGoneP = bellObserver.next(
+  (m) =>
+    m.type === "terminal.list" &&
+    !m.terminals.some((t) => t.terminalId === bellOpened.terminalId),
+  "bell terminal removed from list",
+);
+bellOpener.send({ type: "terminal.close", terminalId: bellOpened.terminalId });
+await bellGoneP;
+const flaggedForAttention = bellObserver.messages.some(
+  (m) =>
+    m.type === "terminal.list" &&
+    m.terminals.some(
+      (t) => t.terminalId === bellOpened.terminalId && t.needsAttention,
+    ),
+);
+check("killing a terminal never flags it for attention", !flaggedForAttention);
+bellOpener.close();
+bellObserver.close();
+
 // --- Scenario 5: remote browser (headless Chromium streamed) -------------------
 // A real browser tab on the daemon's machine, streamed as JPEG frames. Needs a
 // Chrome to drive; with downloads disabled (set below) a machine without one

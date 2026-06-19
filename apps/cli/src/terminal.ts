@@ -147,6 +147,13 @@ interface PersistentTerminal {
   viewer: TerminalSubscriber | null;
   /** Last time this terminal fired an attention notification (debounce). */
   lastAttentionAt: number;
+  /**
+   * Set once the user kills this terminal. A dying agent often emits a bell in
+   * its teardown output; without this guard that final bell would trip the
+   * attention path and fire a spurious notification for a session the user just
+   * deliberately closed.
+   */
+  closing: boolean;
 }
 
 /** Daemon-scoped terminal sessions: spawn, subscribe, list, kill. */
@@ -206,6 +213,7 @@ export class TerminalRegistry {
       serializer,
       viewer: null,
       lastAttentionAt: 0,
+      closing: false,
     };
     screen.onTitleChange((title) => {
       if (title && title !== term.meta.title) {
@@ -228,7 +236,7 @@ export class TerminalRegistry {
         // watching, so still notify.
         const watching =
           term.viewer != null && term.viewer.isForeground?.() !== false;
-        if (!watching && data.includes(BEL)) {
+        if (!term.closing && !watching && data.includes(BEL)) {
           if (!term.meta.needsAttention) {
             term.meta = { ...term.meta, needsAttention: true };
             this.notifyCatalog();
@@ -313,7 +321,12 @@ export class TerminalRegistry {
 
   /** Kill a terminal; removal and notifications happen in the exit callback. */
   close(terminalId: string): void {
-    this.terminals.get(terminalId)?.handle.kill();
+    const term = this.terminals.get(terminalId);
+    if (!term) return;
+    // Suppress the bell the agent may emit while tearing down — the user asked
+    // for this kill, so it must not fire an attention notification.
+    term.closing = true;
+    term.handle.kill();
   }
 
   list(): TerminalMeta[] {
